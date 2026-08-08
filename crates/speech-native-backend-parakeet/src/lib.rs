@@ -947,7 +947,9 @@ impl StreamingNormalizer {
 /// Resolve the EOU model without copying it out of Hugging Face's cache.
 #[must_use]
 pub fn discover_eou_model_dir() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("FTE_PARAKEET_MODEL_DIR") {
+    if let Some(explicit) = std::env::var_os("SPEECH_NATIVE_PARAKEET_MODEL_DIR")
+        .or_else(|| std::env::var_os("FTE_PARAKEET_MODEL_DIR"))
+    {
         let explicit = PathBuf::from(explicit);
         if model_dir_is_complete(&explicit) {
             return Some(explicit);

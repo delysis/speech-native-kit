@@ -71,13 +71,15 @@ async fn drain(
 }
 
 fn real_wav_path() -> Option<PathBuf> {
-    std::env::var_os("FTE_SPEECH_TEST_WAV").map(PathBuf::from)
+    std::env::var_os("SPEECH_NATIVE_TEST_WAV")
+        .or_else(|| std::env::var_os("FTE_SPEECH_TEST_WAV"))
+        .map(PathBuf::from)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Parakeet weights in the Hugging Face cache and FTE_SPEECH_TEST_WAV"]
+#[ignore = "requires Parakeet weights in the Hugging Face cache and SPEECH_NATIVE_TEST_WAV"]
 async fn real_gateway_transcription_and_request_scoped_cancellation() {
-    let wav_path = real_wav_path().expect("FTE_SPEECH_TEST_WAV must point at real English WAV");
+    let wav_path = real_wav_path().expect("SPEECH_NATIVE_TEST_WAV must point at real English WAV");
     let wav = std::fs::read(wav_path).expect("read real WAV fixture");
     let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig::default()).await;
     assert_eq!(backend.readiness(), SpeechBackendReadiness::Ready);
