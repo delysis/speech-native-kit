@@ -1,0 +1,11 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "file-stt"
+description = "Transcribe complete caller-provided audio and cancel the caller's active transcription requests."
+permissions = [
+  "allow-speech-status",
+  "allow-speech-plan-transcription",
+  "allow-speech-transcribe",
+  "allow-speech-cancel",
+]

@@ -1,0 +1,13 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "live-stt"
+description = "Open a live transcription request and push caller-captured audio into its bounded sink."
+permissions = [
+  "allow-speech-status",
+  "allow-speech-plan-transcription",
+  "allow-speech-transcribe-stream",
+  "allow-speech-transcription-audio-push",
+  "allow-speech-transcription-audio-finish",
+  "allow-speech-cancel",
+]

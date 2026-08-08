@@ -1,0 +1,12 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "tts"
+description = "Synthesize caller-provided text and cancel the caller's active synthesis requests."
+permissions = [
+  "allow-speech-status",
+  "allow-speech-plan-synthesis",
+  "allow-speech-synthesize",
+  "allow-speech-synthesize-stream",
+  "allow-speech-cancel",
+]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-synthesize-stream"
+description = "Enables the speech_synthesize_stream command without any pre-configured scope."
+commands.allow = ["speech_synthesize_stream"]
+
+[[permission]]
+identifier = "deny-speech-synthesize-stream"
+description = "Denies the speech_synthesize_stream command without any pre-configured scope."
+commands.deny = ["speech_synthesize_stream"]

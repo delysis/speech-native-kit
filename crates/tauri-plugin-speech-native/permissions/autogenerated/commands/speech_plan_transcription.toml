@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-plan-transcription"
+description = "Enables the speech_plan_transcription command without any pre-configured scope."
+commands.allow = ["speech_plan_transcription"]
+
+[[permission]]
+identifier = "deny-speech-plan-transcription"
+description = "Denies the speech_plan_transcription command without any pre-configured scope."
+commands.deny = ["speech_plan_transcription"]

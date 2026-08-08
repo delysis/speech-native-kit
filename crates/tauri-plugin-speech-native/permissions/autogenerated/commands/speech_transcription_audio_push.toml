@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-transcription-audio-push"
+description = "Enables the speech_transcription_audio_push command without any pre-configured scope."
+commands.allow = ["speech_transcription_audio_push"]
+
+[[permission]]
+identifier = "deny-speech-transcription-audio-push"
+description = "Denies the speech_transcription_audio_push command without any pre-configured scope."
+commands.deny = ["speech_transcription_audio_push"]

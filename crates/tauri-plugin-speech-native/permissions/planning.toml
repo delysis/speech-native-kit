@@ -1,0 +1,10 @@
+"$schema" = "schemas/schema.json"
+
+[[set]]
+identifier = "planning"
+description = "Inspect candidate transcription and synthesis routes without executing them."
+permissions = [
+  "allow-speech-status",
+  "allow-speech-plan-transcription",
+  "allow-speech-plan-synthesis",
+]

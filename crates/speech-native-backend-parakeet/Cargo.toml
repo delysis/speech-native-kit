@@ -1,0 +1,20 @@
+[package]
+name = "speech-native-backend-parakeet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+speech-native-types = { path = "../speech-native-types" }
+hound.workspace = true
+parakeet-rs.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+speech-native-host = { path = "../speech-native-host" }
+
+[lints]
+workspace = true

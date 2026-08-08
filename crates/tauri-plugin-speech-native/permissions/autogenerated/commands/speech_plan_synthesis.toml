@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-plan-synthesis"
+description = "Enables the speech_plan_synthesis command without any pre-configured scope."
+commands.allow = ["speech_plan_synthesis"]
+
+[[permission]]
+identifier = "deny-speech-plan-synthesis"
+description = "Denies the speech_plan_synthesis command without any pre-configured scope."
+commands.deny = ["speech_plan_synthesis"]
