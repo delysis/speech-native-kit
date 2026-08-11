@@ -1,8 +1,10 @@
 # R2 Speech self-reaping and Apple acceptance receipt — 2026-08-11
 
-This receipt covers the uncommitted `R2-SPEECH-REAP` candidate worktree based
-exactly on `speech-native-kit@ac1a15047b9eb8f3e845f27b03b0eae70d70cc90`.
-It does not claim that the candidate is committed, pushed, or released.
+This receipt is anchored to the immutable R2 implementation commit
+`speech-native-kit@1150d1cc5b76af537ae9aae7a57dc5a6d6adc300` and its focused
+Apple lifecycle follow-up commit
+`speech-native-kit@34bc0276c41ba5a8f1a4d53619db63ba51a82cb6`. Neither commit is
+claimed as pushed or released.
 
 ## Bounded lifecycle evidence
 
@@ -38,18 +40,21 @@ SPEECH_NATIVE_PARAKEET_MODEL_DIR=/Users/george/.cache/huggingface/hub/models--al
 cargo test -p speech-native-backend-parakeet --test real_parakeet -- --ignored --nocapture
 ```
 
-Result: 1 passed in 24.49 seconds. Complete and streaming inference both
-returned “hardly beneath the old stone bridge while morning light reached the
-valley”. The test also cancelled one of two peer requests, preserved the peer
-completion, and completed joined shutdown. This remains lifecycle evidence,
-not transcription-accuracy acceptance; the first words were decoded
-incorrectly.
+The original candidate run passed in 24.49 seconds. The independent reaudit
+reran the same command against exact commit
+`1150d1cc5b76af537ae9aae7a57dc5a6d6adc300`; it passed in 7.31 seconds. Complete
+and streaming inference both returned “hardly beneath the old stone bridge
+while morning light reached the valley”. The test also cancelled one of two
+peer requests, preserved the peer completion, and completed joined shutdown.
+This remains lifecycle evidence, not transcription-accuracy acceptance; the
+first words were decoded incorrectly.
 
-## Launched Tauri Apple TTS
+## Historical precommit launched Tauri Apple TTS
 
-The repository does not contain a standalone Tauri consumer. A disposable,
-hidden Tauri 2 consumer at `/tmp/speech-r2-tauri-smoke` used path dependencies
-to this exact worktree, registered `AppleSpeechBackend` through
+The repository does not contain a standalone Tauri consumer. Before commit
+`1150d1cc5b76af537ae9aae7a57dc5a6d6adc300` was created, a disposable, hidden
+Tauri 2 consumer at `/tmp/speech-r2-tauri-smoke` used path dependencies to the
+then-uncommitted worktree, registered `AppleSpeechBackend` through
 `tauri-plugin-speech-native`, synthesized into a buffer without playback, and
 exited through the normal Tauri lifecycle.
 
@@ -71,6 +76,12 @@ APPLE_TAURI_SMOKE_OK request_id=apple-launched-tauri-r2 backend=apple.av-speech 
 The runtime inventory independently reported the Apple backend ready and
 enumerated 191 installed voices without speaking or requesting permission.
 
+This is real launched-completion evidence for the precommit candidate, not
+immutable current-source acceptance. The receipt did not record an executable
+hash, and no executable identity is inferred after the fact. The smoke covered
+a completed synthesis followed by normal exit; it did not exercise shutdown
+while an Apple operation remained active.
+
 Negative launch evidence is retained. The first built binary exited 134 because
 the default deployment target left `libswift_Concurrency.dylib` unresolved. A
 manual `DYLD_LIBRARY_PATH` attempt exited 133 because the older Command Line
@@ -78,10 +89,27 @@ Tools library duplicated Swift runtime classes. Rebuilding with
 `MACOSX_DEPLOYMENT_TARGET=13.0` resolved the runtime boundary and produced the
 successful launched-app receipt above.
 
+## Current-source Apple lifecycle evidence
+
+The independent reaudit checked the production implementation and committed
+deterministic portable tests at
+`34bc0276c41ba5a8f1a4d53619db63ba51a82cb6`. One fixture holds an owned Apple
+worker active, verifies shutdown sets its cancellation flag, verifies shutdown
+does not complete before the worker exits, releases the worker, and verifies
+joined shutdown, an empty active-operation map, and zero active task records.
+A second fixture drives the deterministic `apple_tts_audio_empty` domain error
+and verifies the operation lease self-reaps while the supervisor retains no
+task failure. These are worker-lifecycle tests; they do not synthesize speech.
+
+A fresh launched Apple acceptance run built from the immutable commit remains
+required before claiming current-source launched acceptance. It should record
+the source revision and executable identity and must keep completed-synthesis
+launch evidence distinct from active-operation shutdown evidence.
+
 ## Repository gates
 
 - `cargo fmt --all --check`: passed.
-- `cargo test --workspace --all-targets`: passed; 56 passed, 0 failed,
+- `cargo test --workspace --all-targets`: passed; 58 passed, 0 failed,
   2 environment-gated tests ignored.
 - Rust 1.88 workspace clippy with all targets/features and `-D warnings`:
   passed.
