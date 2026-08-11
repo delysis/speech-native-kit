@@ -1022,6 +1022,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_and_joins_the_owned_apple_worker() {
+        let backend = AppleSpeechBackend::discover()
+            .await
+            .expect("discover Apple TTS");
+        let request_id = SpeechRequestId("blocking-apple-worker".to_string());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        backend
+            .state
+            .spawn_operation(request_id, Arc::clone(&cancelled), move || {
+                started_sender.send(()).expect("signal worker start");
+                release_receiver.recv().expect("release Apple worker");
+            })
+            .expect("spawn blocking Apple fixture worker");
+        started_receiver.recv().expect("Apple worker must start");
+
+        let shutdown_backend = backend.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        release_sender.send(()).expect("release Apple worker");
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("Apple backend shutdown succeeds");
+        backend
+            .shutdown()
+            .await
+            .expect("repeated shutdown retains success");
+
+        let data = backend.state.data.lock().expect("lock closed state");
+        assert_eq!(data.phase, AppleBackendPhase::Closed);
+        assert!(data.active.is_empty());
+        drop(data);
+        let task_state = backend.state.tasks.snapshot().expect("read task state");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn apple_domain_error_self_reaps_without_task_failure() {
+        let state = Arc::new(AppleBackendState::default());
+        let request_id = SpeechRequestId("apple-domain-error".to_string());
+        let worker_request_id = request_id.clone();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        state
+            .spawn_operation(request_id, Arc::new(AtomicBool::new(false)), move || {
+                let result = encode_wav(&worker_request_id, &[]);
+                result_sender.send(result).expect("send domain result");
+            })
+            .expect("spawn domain-error fixture worker");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("wait for domain-error worker");
+
+        let error = result_receiver
+            .recv()
+            .expect("receive domain result")
+            .expect_err("empty Apple buffers must produce a domain error");
+        assert_eq!(error.code, "apple_tts_audio_empty");
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+        let task_state = state.tasks.snapshot().expect("read task state");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
     async fn apple_worker_panic_is_preserved_before_reaping() {
         let state = Arc::new(AppleBackendState::default());
         state
