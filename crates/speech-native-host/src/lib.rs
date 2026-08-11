@@ -10,7 +10,8 @@ use speech_native_types::{
     CapabilitySourceReport, PlatformCapabilitySnapshot, PlatformTarget, ProbeSourceStatus,
     SPEECH_CAPABILITY_SCHEMA, SpeechBackend, SpeechBackendDescriptor, SpeechCancellation,
     SpeechError, SpeechErrorClass, SpeechRequestId, SpeechRouteSelector, SynthesisRequest,
-    SynthesisTicket, TranscriptionRequest, TranscriptionTicket,
+    SynthesisTicket, TaskSupervisor, TaskSupervisorError, TranscriptionRequest,
+    TranscriptionTicket,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -18,7 +19,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::task::JoinSet;
 
 const REGISTERED_SOURCE_ID: &str = "registered-speech-backends";
 
@@ -41,6 +41,8 @@ pub enum SpeechHostError {
     AdmissionClosed,
     #[error("speech request id is already active: {request_id}")]
     RequestDuplicate { request_id: SpeechRequestId },
+    #[error("speech request nonce space is exhausted")]
+    NonceExhausted,
     #[error("one or more speech backends failed during shutdown")]
     Shutdown { failures: Vec<SpeechError> },
 }
@@ -93,7 +95,7 @@ struct HostState {
 struct HostLifecycle {
     state: Mutex<HostState>,
     changed: Notify,
-    monitors: Mutex<JoinSet<()>>,
+    tasks: Arc<TaskSupervisor>,
 }
 
 struct HostCancellation {
@@ -144,7 +146,7 @@ impl SpeechHost {
                     shutdown_result: None,
                 }),
                 changed: Notify::new(),
-                monitors: Mutex::new(JoinSet::new()),
+                tasks: Arc::new(TaskSupervisor::default()),
             }),
         }
     }
@@ -358,6 +360,11 @@ impl SpeechHost {
             return self.wait_for_shutdown().await;
         }
 
+        self.lifecycle
+            .tasks
+            .begin_shutdown()
+            .map_err(map_task_supervisor_error)?;
+
         for (request_id, operation) in active {
             operation
                 .cancellation_requested
@@ -371,22 +378,27 @@ impl SpeechHost {
             }
         }
         self.wait_for_active_empty().await?;
-        let mut monitors = {
-            let mut guard = self
-                .lifecycle
-                .monitors
-                .lock()
-                .map_err(|_| SpeechHostError::StateUnavailable)?;
-            std::mem::replace(&mut *guard, JoinSet::new())
-        };
-        while let Some(joined) = monitors.join_next().await {
-            if let Err(error) = joined {
-                failures.push(SpeechError::unavailable(
-                    &SpeechRequestId("speech-host-monitor".to_string()),
-                    "speech_host_monitor_failed",
-                    &format!("speech host monitor task failed: {error}"),
-                ));
-            }
+        self.lifecycle
+            .tasks
+            .wait_for_idle()
+            .await
+            .map_err(map_task_supervisor_error)?;
+        if let Some(summary) = self
+            .lifecycle
+            .tasks
+            .failure_summary()
+            .map_err(map_task_supervisor_error)?
+        {
+            let additional = summary.additional_failures;
+            let first = summary.first;
+            failures.push(SpeechError::unavailable(
+                &SpeechRequestId("speech-host-monitor".to_string()),
+                "speech_host_monitor_failed",
+                &format!(
+                    "speech host monitor '{}' failed ({:?}): {}; {additional} additional failure(s)",
+                    first.label, first.kind, first.detail
+                ),
+            ));
         }
         let result = if failures.is_empty() {
             Ok(())
@@ -449,7 +461,10 @@ impl SpeechHost {
             }
         })?;
         let nonce = state.next_nonce;
-        state.next_nonce = state.next_nonce.wrapping_add(1);
+        state.next_nonce = state
+            .next_nonce
+            .checked_add(1)
+            .ok_or(SpeechHostError::NonceExhausted)?;
         let operation = Arc::new(ActiveSpeechOperation {
             backend: Arc::clone(&backend),
             nonce,
@@ -468,11 +483,12 @@ impl SpeechHost {
         monitor: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), SpeechHostError> {
         self.lifecycle
-            .monitors
-            .lock()
-            .map_err(|_| SpeechHostError::StateUnavailable)?
-            .spawn(monitor);
-        Ok(())
+            .tasks
+            .spawn("host-final-relay", async move {
+                monitor.await;
+                Ok(())
+            })
+            .map_err(map_task_supervisor_error)
     }
 
     async fn wait_for_active_empty(&self) -> Result<(), SpeechHostError> {
@@ -507,6 +523,15 @@ impl SpeechHost {
                 return result.unwrap_or(Err(SpeechHostError::StateUnavailable));
             }
             changed.await;
+        }
+    }
+}
+
+fn map_task_supervisor_error(error: TaskSupervisorError) -> SpeechHostError {
+    match error {
+        TaskSupervisorError::AdmissionClosed => SpeechHostError::AdmissionClosed,
+        TaskSupervisorError::StateUnavailable | TaskSupervisorError::RuntimeUnavailable => {
+            SpeechHostError::StateUnavailable
         }
     }
 }
@@ -1147,5 +1172,91 @@ mod tests {
             host.synthesize(exact_request("late", "deferred.tts")).await,
             Err(SpeechHostError::AdmissionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_fixture_operations_self_reap_task_state() {
+        let host = SpeechHost::default();
+        host.register_backend(fixture_backend("fixture.tts"))
+            .expect("register fixture backend");
+
+        for index in 0..10_000 {
+            let ticket = host
+                .synthesize(exact_request(
+                    &format!("bounded-task-{index}"),
+                    "fixture.tts",
+                ))
+                .await
+                .expect("fixture request must be admitted");
+            ticket
+                .final_response()
+                .await
+                .expect("every fixture request has a final response");
+        }
+
+        host.lifecycle
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("task supervisor remains available");
+        assert_eq!(
+            host.lifecycle
+                .state
+                .lock()
+                .expect("lock host state")
+                .active
+                .len(),
+            0
+        );
+        let task_state = host
+            .lifecycle
+            .tasks
+            .snapshot()
+            .expect("task supervisor remains available");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn monitor_panic_is_preserved_in_shutdown_evidence() {
+        let host = SpeechHost::default();
+        host.spawn_monitor(async { panic!("fixture monitor panic") })
+            .expect("spawn fixture monitor");
+
+        let error = host
+            .shutdown()
+            .await
+            .expect_err("monitor panic must fail shutdown");
+        let SpeechHostError::Shutdown { failures } = error else {
+            panic!("expected shutdown failure");
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].code, "speech_host_monitor_failed");
+        assert!(failures[0].safe_detail.contains("fixture monitor panic"));
+    }
+
+    #[test]
+    fn host_nonce_exhaustion_fails_closed() {
+        let host = SpeechHost::default();
+        host.register_backend(fixture_backend("fixture.tts"))
+            .expect("register fixture backend");
+        host.lifecycle
+            .state
+            .lock()
+            .expect("lock host state")
+            .next_nonce = u64::MAX;
+
+        assert!(matches!(
+            host.reserve_synthesis(&exact_request("nonce-exhausted", "fixture.tts")),
+            Err(SpeechHostError::NonceExhausted)
+        ));
+        assert!(
+            host.lifecycle
+                .state
+                .lock()
+                .expect("lock host state")
+                .active
+                .is_empty()
+        );
     }
 }
