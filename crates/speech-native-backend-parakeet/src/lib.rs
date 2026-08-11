@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 pub const PARAKEET_BACKEND_ID: &str = "parakeet-rs.eou-120m";
 pub const PARAKEET_MODEL_ID: &str = "parakeet-realtime-eou-120m-v1-onnx";
@@ -51,10 +52,30 @@ pub struct ParakeetSpeechBackend {
     state: Arc<BackendState>,
 }
 
-#[derive(Default)]
 struct BackendState {
-    active: Mutex<HashMap<SpeechRequestId, Arc<AtomicBool>>>,
-    shutting_down: AtomicBool,
+    data: Mutex<BackendStateData>,
+    workers: Mutex<JoinSet<()>>,
+    changed: Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendPhase {
+    Running,
+    Quiescing,
+    Closed,
+}
+
+struct BackendStateData {
+    phase: BackendPhase,
+    next_nonce: u64,
+    active: HashMap<SpeechRequestId, ActiveParakeetOperation>,
+    shutdown_result: Option<Result<(), SpeechError>>,
+}
+
+struct ActiveParakeetOperation {
+    cancelled: Arc<AtomicBool>,
+    stream: Option<Arc<StreamControl>>,
+    nonce: u64,
 }
 
 struct BackendCancellation {
@@ -64,8 +85,93 @@ struct BackendCancellation {
 struct StreamAudioSink {
     request_id: SpeechRequestId,
     format: PcmFormat,
+    control: Arc<StreamControl>,
+}
+
+struct StreamControl {
     sender: Mutex<Option<mpsc::Sender<AudioChunk>>>,
     finished: AtomicBool,
+}
+
+struct BackendOperationLease {
+    state: Arc<BackendState>,
+    request_id: SpeechRequestId,
+    nonce: u64,
+}
+
+impl Default for BackendState {
+    fn default() -> Self {
+        Self {
+            data: Mutex::new(BackendStateData {
+                phase: BackendPhase::Running,
+                next_nonce: 0,
+                active: HashMap::new(),
+                shutdown_result: None,
+            }),
+            workers: Mutex::new(JoinSet::new()),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl BackendState {
+    fn spawn_operation(
+        self: &Arc<Self>,
+        request_id: SpeechRequestId,
+        cancelled: Arc<AtomicBool>,
+        stream: Option<Arc<StreamControl>>,
+        worker: impl FnOnce() + Send + 'static,
+    ) -> Result<(), SpeechError> {
+        let mut data = self.data.lock().map_err(|_| state_error())?;
+        if data.phase != BackendPhase::Running {
+            return Err(backend_error(
+                &request_id,
+                "parakeet_shutting_down",
+                SpeechErrorClass::Unavailable,
+                true,
+                "The embedded Parakeet backend is shutting down",
+            ));
+        }
+        if data.active.contains_key(&request_id) {
+            return Err(backend_error(
+                &request_id,
+                "speech_request_duplicate",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "A speech request with this request_id is already active",
+            ));
+        }
+        let nonce = data.next_nonce;
+        data.next_nonce = data.next_nonce.wrapping_add(1);
+        let mut workers = self.workers.lock().map_err(|_| {
+            backend_error(
+                &request_id,
+                "parakeet_worker_state_unavailable",
+                SpeechErrorClass::Internal,
+                true,
+                "Parakeet worker state is unavailable",
+            )
+        })?;
+        let state = Arc::clone(self);
+        let worker_request_id = request_id.clone();
+        workers.spawn_blocking(move || {
+            let _lease = BackendOperationLease {
+                state,
+                request_id: worker_request_id,
+                nonce,
+            };
+            worker();
+        });
+        data.active.insert(
+            request_id,
+            ActiveParakeetOperation {
+                cancelled,
+                stream,
+                nonce,
+            },
+        );
+        Ok(())
+    }
 }
 
 impl ParakeetSpeechBackend {
@@ -109,42 +215,6 @@ impl ParakeetSpeechBackend {
             state: Arc::new(BackendState::default()),
         }
     }
-
-    fn register_request(
-        &self,
-        request_id: &SpeechRequestId,
-    ) -> Result<Arc<AtomicBool>, SpeechError> {
-        if self.state.shutting_down.load(Ordering::Acquire) {
-            return Err(backend_error(
-                request_id,
-                "parakeet_shutting_down",
-                SpeechErrorClass::Unavailable,
-                true,
-                "The embedded Parakeet backend is shutting down",
-            ));
-        }
-        let mut active = self.state.active.lock().map_err(|_| {
-            backend_error(
-                request_id,
-                "parakeet_state_unavailable",
-                SpeechErrorClass::Internal,
-                true,
-                "Parakeet request state is unavailable",
-            )
-        })?;
-        if active.contains_key(request_id) {
-            return Err(backend_error(
-                request_id,
-                "speech_request_duplicate",
-                SpeechErrorClass::InvalidRequest,
-                false,
-                "A speech request with this request_id is already active",
-            ));
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        active.insert(request_id.clone(), Arc::clone(&cancelled));
-        Ok(cancelled)
-    }
 }
 
 #[async_trait]
@@ -172,40 +242,42 @@ impl SpeechBackend for ParakeetSpeechBackend {
             )
         })?;
         let request_id = request.context.request_id.clone();
-        let cancelled = self.register_request(&request_id)?;
         let (event_sender, event_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_sender, final_receiver) = oneshot::channel();
-        let state = Arc::clone(&self.state);
-        let worker_id = request_id.clone();
 
-        let (audio_sender, audio_receiver, audio_sink) = match &request.input {
+        let (audio_receiver, audio_sink, stream_control) = match &request.input {
             TranscriptionInput::Complete { .. } => (None, None, None),
             TranscriptionInput::Stream { format, .. } => {
                 let (sender, receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+                let control = Arc::new(StreamControl {
+                    sender: Mutex::new(Some(sender)),
+                    finished: AtomicBool::new(false),
+                });
                 let sink: Arc<dyn TranscriptionAudioSink> = Arc::new(StreamAudioSink {
                     request_id: request_id.clone(),
                     format: *format,
-                    sender: Mutex::new(Some(sender.clone())),
-                    finished: AtomicBool::new(false),
+                    control: Arc::clone(&control),
                 });
-                (Some(sender), Some(receiver), Some(sink))
+                (Some(receiver), Some(sink), Some(control))
             }
         };
-        drop(audio_sender);
-
-        drop(tokio::task::spawn_blocking(move || {
-            run_transcription(
-                request,
-                model,
-                audio_receiver,
-                Arc::clone(&cancelled),
-                &event_sender,
-                final_sender,
-            );
-            if let Ok(mut active) = state.active.lock() {
-                active.remove(&worker_id);
-            }
-        }));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        self.state.spawn_operation(
+            request_id.clone(),
+            Arc::clone(&cancelled),
+            stream_control,
+            move || {
+                run_transcription(
+                    request,
+                    model,
+                    audio_receiver,
+                    worker_cancelled,
+                    &event_sender,
+                    final_sender,
+                );
+            },
+        )?;
 
         Ok(TranscriptionTicket::new(
             request_id,
@@ -233,20 +305,56 @@ impl SpeechBackend for ParakeetSpeechBackend {
     }
 
     async fn shutdown(&self) -> Result<(), SpeechError> {
-        self.state.shutting_down.store(true, Ordering::Release);
-        let active = self.state.active.lock().map_err(|_| {
-            backend_error(
-                &SpeechRequestId("parakeet-shutdown".to_string()),
-                "parakeet_state_unavailable",
-                SpeechErrorClass::Internal,
-                true,
-                "Parakeet request state is unavailable",
-            )
-        })?;
-        for cancelled in active.values() {
-            cancelled.store(true, Ordering::Release);
+        let leader = {
+            let mut data = self.state.data.lock().map_err(|_| state_error())?;
+            match data.phase {
+                BackendPhase::Running => {
+                    data.phase = BackendPhase::Quiescing;
+                    for operation in data.active.values() {
+                        cancel_operation(operation);
+                    }
+                    true
+                }
+                BackendPhase::Quiescing => false,
+                BackendPhase::Closed => {
+                    return data
+                        .shutdown_result
+                        .clone()
+                        .unwrap_or_else(|| Err(state_error()));
+                }
+            }
+        };
+        if !leader {
+            return wait_for_backend_shutdown(&self.state).await;
         }
-        Ok(())
+
+        let mut workers = {
+            let mut workers = self.state.workers.lock().map_err(|_| state_error())?;
+            std::mem::replace(&mut *workers, JoinSet::new())
+        };
+        let mut failure = None;
+        while let Some(result) = workers.join_next().await {
+            if let Err(error) = result {
+                failure.get_or_insert_with(|| {
+                    backend_error(
+                        &SpeechRequestId("parakeet-shutdown".to_string()),
+                        "parakeet_worker_failed",
+                        SpeechErrorClass::Internal,
+                        false,
+                        &format!("A Parakeet worker failed during shutdown: {error}"),
+                    )
+                });
+            }
+        }
+        let result = failure.map_or(Ok(()), Err);
+        {
+            let mut data = self.state.data.lock().map_err(|_| state_error())?;
+            data.active.clear();
+            data.shutdown_result = Some(result.clone());
+            data.phase = BackendPhase::Closed;
+        }
+        self.state.changed.notify_waiters();
+        result
     }
 }
 
@@ -259,7 +367,7 @@ impl SpeechCancellation for BackendCancellation {
 #[async_trait]
 impl TranscriptionAudioSink for StreamAudioSink {
     async fn push(&self, chunk: AudioChunk) -> Result<(), SpeechError> {
-        if self.finished.load(Ordering::Acquire) {
+        if self.control.finished.load(Ordering::Acquire) {
             return Err(backend_error(
                 &self.request_id,
                 "audio_stream_finished",
@@ -279,6 +387,7 @@ impl TranscriptionAudioSink for StreamAudioSink {
             ));
         }
         let sender = self
+            .control
             .sender
             .lock()
             .map_err(|_| stream_closed_error(&self.request_id))?
@@ -287,14 +396,19 @@ impl TranscriptionAudioSink for StreamAudioSink {
         sender
             .send(chunk)
             .await
-            .map_err(|_| stream_closed_error(&self.request_id))
+            .map_err(|_| stream_closed_error(&self.request_id))?;
+        if self.control.finished.load(Ordering::Acquire) {
+            return Err(stream_closed_error(&self.request_id));
+        }
+        Ok(())
     }
 
     async fn finish(&self) -> Result<(), SpeechError> {
-        if self.finished.swap(true, Ordering::AcqRel) {
+        if self.control.finished.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.sender
+        self.control
+            .sender
             .lock()
             .map_err(|_| stream_closed_error(&self.request_id))?
             .take();
@@ -303,13 +417,61 @@ impl TranscriptionAudioSink for StreamAudioSink {
 }
 
 fn cancel_request(state: &BackendState, request_id: &SpeechRequestId) -> usize {
-    let Ok(active) = state.active.lock() else {
+    let Ok(data) = state.data.lock() else {
         return 0;
     };
-    active.get(request_id).map_or(0, |cancelled| {
-        cancelled.store(true, Ordering::Release);
+    data.active.get(request_id).map_or(0, |operation| {
+        cancel_operation(operation);
         1
     })
+}
+
+fn cancel_operation(operation: &ActiveParakeetOperation) {
+    operation.cancelled.store(true, Ordering::Release);
+    if let Some(stream) = &operation.stream {
+        stream.finished.store(true, Ordering::Release);
+        if let Ok(mut sender) = stream.sender.lock() {
+            sender.take();
+        }
+    }
+}
+
+impl Drop for BackendOperationLease {
+    fn drop(&mut self) {
+        if let Ok(mut data) = self.state.data.lock()
+            && data
+                .active
+                .get(&self.request_id)
+                .is_some_and(|operation| operation.nonce == self.nonce)
+        {
+            data.active.remove(&self.request_id);
+            self.state.changed.notify_waiters();
+        }
+    }
+}
+
+async fn wait_for_backend_shutdown(state: &BackendState) -> Result<(), SpeechError> {
+    loop {
+        let changed = state.changed.notified();
+        let result = {
+            let data = state.data.lock().map_err(|_| state_error())?;
+            (data.phase == BackendPhase::Closed).then(|| data.shutdown_result.clone())
+        };
+        if let Some(result) = result {
+            return result.unwrap_or_else(|| Err(state_error()));
+        }
+        changed.await;
+    }
+}
+
+fn state_error() -> SpeechError {
+    backend_error(
+        &SpeechRequestId("parakeet-shutdown".to_string()),
+        "parakeet_state_unavailable",
+        SpeechErrorClass::Internal,
+        true,
+        "Parakeet request state is unavailable",
+    )
 }
 
 fn validate_request(request: &TranscriptionRequest) -> Result<(), SpeechError> {
@@ -1242,5 +1404,127 @@ mod tests {
         ));
         assert!(!descriptor.capabilities[0].eligible_for_local_only());
         assert!(!descriptor.models[0].resident);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_the_owned_blocking_worker() {
+        let backend = ParakeetSpeechBackend::unavailable(asset_required_descriptor());
+        let request_id = SpeechRequestId("blocking-worker".to_string());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        backend
+            .state
+            .spawn_operation(
+                request_id.clone(),
+                Arc::clone(&cancelled),
+                None,
+                move || {
+                    started_sender.send(()).expect("signal worker start");
+                    release_receiver.recv().expect("release blocking worker");
+                },
+            )
+            .expect("spawn blocking fixture worker");
+        started_receiver.recv().expect("worker must start");
+
+        let duplicate = backend.state.spawn_operation(
+            request_id.clone(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            || {},
+        );
+        assert_eq!(
+            duplicate.err().map(|error| error.code).as_deref(),
+            Some("speech_request_duplicate")
+        );
+
+        let shutdown_backend = backend.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        release_sender.send(()).expect("release worker");
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("backend shutdown succeeds");
+        backend
+            .shutdown()
+            .await
+            .expect("repeated shutdown retains success");
+
+        let data = backend.state.data.lock().expect("lock closed state");
+        assert_eq!(data.phase, BackendPhase::Closed);
+        assert!(data.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_sink_rejects_push_after_finish() {
+        let request_id = SpeechRequestId("finished-stream".to_string());
+        let (sender, _receiver) = mpsc::channel(1);
+        let sink = StreamAudioSink {
+            request_id: request_id.clone(),
+            format: PcmFormat {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                sample_format: PcmSampleFormat::I16Le,
+                interleaved: true,
+            },
+            control: Arc::new(StreamControl {
+                sender: Mutex::new(Some(sender)),
+                finished: AtomicBool::new(false),
+            }),
+        };
+        sink.finish().await.expect("finish stream");
+        let error = sink
+            .push(AudioChunk {
+                sequence: 0,
+                sample_offset: 0,
+                format: sink.format,
+                data: vec![0, 0],
+                end_of_stream: true,
+            })
+            .await
+            .expect_err("push after finish must fail");
+        assert_eq!(error.code, "audio_stream_finished");
+    }
+
+    #[tokio::test]
+    async fn cancellation_closes_the_stream_input_sink() {
+        let request_id = SpeechRequestId("cancelled-stream".to_string());
+        let (sender, _receiver) = mpsc::channel(1);
+        let control = Arc::new(StreamControl {
+            sender: Mutex::new(Some(sender)),
+            finished: AtomicBool::new(false),
+        });
+        let sink = StreamAudioSink {
+            request_id: request_id.clone(),
+            format: PcmFormat {
+                sample_rate_hz: 16_000,
+                channels: 1,
+                sample_format: PcmSampleFormat::I16Le,
+                interleaved: true,
+            },
+            control: Arc::clone(&control),
+        };
+        cancel_operation(&ActiveParakeetOperation {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            stream: Some(control),
+            nonce: 0,
+        });
+        let error = sink
+            .push(AudioChunk {
+                sequence: 0,
+                sample_offset: 0,
+                format: sink.format,
+                data: vec![0, 0],
+                end_of_stream: true,
+            })
+            .await
+            .expect_err("cancelled stream must reject input");
+        assert_eq!(error.code, "audio_stream_finished");
     }
 }

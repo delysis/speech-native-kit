@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
-use tauri::{Manager, Runtime, State};
+use tauri::{Manager, RunEvent, Runtime, State};
 
 pub struct Builder {
     speech: Arc<SpeechHost>,
@@ -68,11 +68,17 @@ impl Builder {
                 });
                 Ok(())
             })
+            .on_event(|app, event| {
+                if matches!(event, RunEvent::Exit)
+                    && let Err(error) = shutdown_plugin(app)
+                {
+                    eprintln!("speech-native shutdown failed at application exit: {error}");
+                }
+            })
             .on_drop(|app| {
-                let speech = Arc::clone(&app.state::<SpeechPluginState>().speech);
-                tauri::async_runtime::block_on(async move {
-                    let _ = speech.shutdown().await;
-                });
+                if let Err(error) = shutdown_plugin(&app) {
+                    eprintln!("speech-native shutdown failed while dropping plugin: {error}");
+                }
             })
             .build()
     }
@@ -81,6 +87,21 @@ impl Builder {
 struct SpeechPluginState {
     speech: Arc<SpeechHost>,
     inputs: Mutex<HashMap<SpeechRequestId, Arc<dyn TranscriptionAudioSink>>>,
+}
+
+fn shutdown_plugin<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), SpeechHostError> {
+    let Some(state) = app.try_state::<SpeechPluginState>() else {
+        return Ok(());
+    };
+    state
+        .inputs
+        .lock()
+        .map_err(|_| {
+            speech_input_state_unavailable(&SpeechRequestId("speech-shutdown".to_string()))
+        })?
+        .clear();
+    let speech = Arc::clone(&state.speech);
+    tauri::async_runtime::block_on(async move { speech.shutdown().await })
 }
 
 pub trait SpeechNativeExt<R: Runtime> {

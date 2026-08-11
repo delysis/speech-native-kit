@@ -25,7 +25,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::task::JoinSet;
 
 const APPLE_TTS_BACKEND_ID: &str = "apple.av-speech";
 
@@ -35,14 +36,54 @@ pub struct AppleSpeechBackend {
     state: Arc<AppleBackendState>,
 }
 
-#[derive(Default)]
 struct AppleBackendState {
-    active: Mutex<HashMap<SpeechRequestId, Arc<AtomicBool>>>,
-    shutting_down: AtomicBool,
+    data: Mutex<AppleBackendStateData>,
+    workers: Mutex<JoinSet<()>>,
+    changed: Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppleBackendPhase {
+    Running,
+    Quiescing,
+    Closed,
+}
+
+struct AppleBackendStateData {
+    phase: AppleBackendPhase,
+    next_nonce: u64,
+    active: HashMap<SpeechRequestId, ActiveAppleOperation>,
+    shutdown_result: Option<Result<(), SpeechError>>,
+}
+
+struct ActiveAppleOperation {
+    cancelled: Arc<AtomicBool>,
+    nonce: u64,
 }
 
 struct AppleCancellation {
     state: Arc<AppleBackendState>,
+}
+
+struct AppleOperationLease {
+    state: Arc<AppleBackendState>,
+    request_id: SpeechRequestId,
+    nonce: u64,
+}
+
+impl Default for AppleBackendState {
+    fn default() -> Self {
+        Self {
+            data: Mutex::new(AppleBackendStateData {
+                phase: AppleBackendPhase::Running,
+                next_nonce: 0,
+                active: HashMap::new(),
+                shutdown_result: None,
+            }),
+            workers: Mutex::new(JoinSet::new()),
+            changed: Notify::new(),
+        }
+    }
 }
 
 impl AppleSpeechBackend {
@@ -64,42 +105,6 @@ impl AppleSpeechBackend {
             descriptor,
             state: Arc::new(AppleBackendState::default()),
         })
-    }
-
-    fn register_request(
-        &self,
-        request_id: &SpeechRequestId,
-    ) -> Result<Arc<AtomicBool>, SpeechError> {
-        if self.state.shutting_down.load(Ordering::Acquire) {
-            return Err(backend_error(
-                request_id,
-                "apple_tts_shutting_down",
-                SpeechErrorClass::Unavailable,
-                true,
-                "Apple speech synthesis is shutting down",
-            ));
-        }
-        let mut active = self.state.active.lock().map_err(|_| {
-            backend_error(
-                request_id,
-                "apple_tts_state_unavailable",
-                SpeechErrorClass::Internal,
-                true,
-                "Apple speech synthesis request state is unavailable",
-            )
-        })?;
-        if active.contains_key(request_id) {
-            return Err(backend_error(
-                request_id,
-                "speech_request_duplicate",
-                SpeechErrorClass::InvalidRequest,
-                false,
-                "A speech request with this request_id is already active",
-            ));
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        active.insert(request_id.clone(), Arc::clone(&cancelled));
-        Ok(cancelled)
     }
 }
 
@@ -137,25 +142,58 @@ impl SpeechBackend for AppleSpeechBackend {
             backend_kind: SpeechBackendKind::PlatformOnDevice,
             network: NetworkBehavior::Never,
         };
-        let cancelled = self.register_request(&request_id)?;
         let (event_sender, event_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_sender, final_receiver) = oneshot::channel();
-        let state = Arc::clone(&self.state);
-        let worker_request_id = request_id.clone();
-
-        drop(tokio::task::spawn_blocking(move || {
-            run_synthesis(
-                request,
-                voice,
-                route,
-                Arc::clone(&cancelled),
-                &event_sender,
-                final_sender,
-            );
-            if let Ok(mut active) = state.active.lock() {
-                active.remove(&worker_request_id);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        {
+            let mut data = self.state.data.lock().map_err(|_| apple_state_error())?;
+            if data.phase != AppleBackendPhase::Running {
+                return Err(backend_error(
+                    &request_id,
+                    "apple_tts_shutting_down",
+                    SpeechErrorClass::Unavailable,
+                    true,
+                    "Apple speech synthesis is shutting down",
+                ));
             }
-        }));
+            if data.active.contains_key(&request_id) {
+                return Err(backend_error(
+                    &request_id,
+                    "speech_request_duplicate",
+                    SpeechErrorClass::InvalidRequest,
+                    false,
+                    "A speech request with this request_id is already active",
+                ));
+            }
+            let nonce = data.next_nonce;
+            data.next_nonce = data.next_nonce.wrapping_add(1);
+            let mut workers = self.state.workers.lock().map_err(|_| apple_state_error())?;
+            let state = Arc::clone(&self.state);
+            let worker_request_id = request_id.clone();
+            let worker_cancelled = Arc::clone(&cancelled);
+            workers.spawn_blocking(move || {
+                let _lease = AppleOperationLease {
+                    state,
+                    request_id: worker_request_id,
+                    nonce,
+                };
+                run_synthesis(
+                    request,
+                    voice,
+                    route,
+                    worker_cancelled,
+                    &event_sender,
+                    final_sender,
+                );
+            });
+            data.active.insert(
+                request_id.clone(),
+                ActiveAppleOperation {
+                    cancelled: Arc::clone(&cancelled),
+                    nonce,
+                },
+            );
+        }
 
         Ok(SynthesisTicket::new(
             request_id,
@@ -172,20 +210,55 @@ impl SpeechBackend for AppleSpeechBackend {
     }
 
     async fn shutdown(&self) -> Result<(), SpeechError> {
-        self.state.shutting_down.store(true, Ordering::Release);
-        let active = self.state.active.lock().map_err(|_| {
-            backend_error(
-                &SpeechRequestId("apple-shutdown".to_string()),
-                "apple_tts_state_unavailable",
-                SpeechErrorClass::Internal,
-                true,
-                "Apple speech synthesis request state is unavailable",
-            )
-        })?;
-        for cancelled in active.values() {
-            cancelled.store(true, Ordering::Release);
+        let leader = {
+            let mut data = self.state.data.lock().map_err(|_| apple_state_error())?;
+            match data.phase {
+                AppleBackendPhase::Running => {
+                    data.phase = AppleBackendPhase::Quiescing;
+                    for operation in data.active.values() {
+                        operation.cancelled.store(true, Ordering::Release);
+                    }
+                    true
+                }
+                AppleBackendPhase::Quiescing => false,
+                AppleBackendPhase::Closed => {
+                    return data
+                        .shutdown_result
+                        .clone()
+                        .unwrap_or_else(|| Err(apple_state_error()));
+                }
+            }
+        };
+        if !leader {
+            return wait_for_apple_shutdown(&self.state).await;
         }
-        Ok(())
+        let mut workers = {
+            let mut workers = self.state.workers.lock().map_err(|_| apple_state_error())?;
+            std::mem::replace(&mut *workers, JoinSet::new())
+        };
+        let mut failure = None;
+        while let Some(result) = workers.join_next().await {
+            if let Err(error) = result {
+                failure.get_or_insert_with(|| {
+                    backend_error(
+                        &SpeechRequestId("apple-shutdown".to_string()),
+                        "apple_tts_worker_failed",
+                        SpeechErrorClass::Internal,
+                        false,
+                        &format!("An Apple speech worker failed during shutdown: {error}"),
+                    )
+                });
+            }
+        }
+        let result = failure.map_or(Ok(()), Err);
+        {
+            let mut data = self.state.data.lock().map_err(|_| apple_state_error())?;
+            data.active.clear();
+            data.shutdown_result = Some(result.clone());
+            data.phase = AppleBackendPhase::Closed;
+        }
+        self.state.changed.notify_waiters();
+        result
     }
 }
 
@@ -196,13 +269,51 @@ impl SpeechCancellation for AppleCancellation {
 }
 
 fn cancel_request(state: &AppleBackendState, request_id: &SpeechRequestId) -> usize {
-    let Ok(active) = state.active.lock() else {
+    let Ok(data) = state.data.lock() else {
         return 0;
     };
-    active.get(request_id).map_or(0, |cancelled| {
-        cancelled.store(true, Ordering::Release);
+    data.active.get(request_id).map_or(0, |operation| {
+        operation.cancelled.store(true, Ordering::Release);
         1
     })
+}
+
+impl Drop for AppleOperationLease {
+    fn drop(&mut self) {
+        if let Ok(mut data) = self.state.data.lock()
+            && data
+                .active
+                .get(&self.request_id)
+                .is_some_and(|operation| operation.nonce == self.nonce)
+        {
+            data.active.remove(&self.request_id);
+            self.state.changed.notify_waiters();
+        }
+    }
+}
+
+async fn wait_for_apple_shutdown(state: &AppleBackendState) -> Result<(), SpeechError> {
+    loop {
+        let changed = state.changed.notified();
+        let result = {
+            let data = state.data.lock().map_err(|_| apple_state_error())?;
+            (data.phase == AppleBackendPhase::Closed).then(|| data.shutdown_result.clone())
+        };
+        if let Some(result) = result {
+            return result.unwrap_or_else(|| Err(apple_state_error()));
+        }
+        changed.await;
+    }
+}
+
+fn apple_state_error() -> SpeechError {
+    backend_error(
+        &SpeechRequestId("apple-shutdown".to_string()),
+        "apple_tts_state_unavailable",
+        SpeechErrorClass::Internal,
+        true,
+        "Apple speech synthesis request state is unavailable",
+    )
 }
 
 fn validate_request(request: &SynthesisRequest) -> Result<(), SpeechError> {
@@ -823,10 +934,20 @@ mod tests {
             .await
             .expect("discover Apple TTS");
         let request_id = SpeechRequestId("apple-duplicate".to_string());
-        let _active = backend
-            .register_request(&request_id)
-            .expect("register first request");
-        let second = backend.register_request(&request_id);
+        backend
+            .state
+            .data
+            .lock()
+            .expect("lock Apple backend state")
+            .active
+            .insert(
+                request_id.clone(),
+                ActiveAppleOperation {
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    nonce: 1,
+                },
+            );
+        let second = backend.synthesize(request("apple-duplicate")).await;
         assert_eq!(
             second.err().map(|error| error.code).as_deref(),
             Some("speech_request_duplicate")

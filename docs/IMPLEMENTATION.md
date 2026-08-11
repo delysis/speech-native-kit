@@ -8,7 +8,11 @@ typed requests, streams, responses, capabilities, and terminal events in
 Live transcription returns a ticket with a bounded event receiver and a typed,
 backpressured `TranscriptionAudioSink`. Complete-file transcription omits that
 sink. Dropping either ticket invokes cancellation; terminal results remain
-authoritative in Rust.
+authoritative in Rust. Ticket drop never releases the host-wide request ID:
+the host retains a private operation lease until the selected backend's final
+response resolves, even when the consumer abandons its event or final channel.
+Request IDs are unique across every registered backend for their complete
+executor lifetime, not merely for the lifetime of a client handle.
 
 This slice establishes five reusable crates:
 
@@ -21,7 +25,8 @@ This slice establishes five reusable crates:
   policy ordering, exact model/voice routing, and complete rejection receipts.
 - `speech-native-host`: a Tauri-independent registry and execution service that
   plans only across actually registered backends, pins the resolved
-  backend/model/voice into each request, and owns cancellation and shutdown.
+  backend/model/voice into each request, owns cancellation and shutdown, and
+  relays backend finals through host-owned monitor tasks.
 - `speech-native-backend-parakeet`: an executable, embedded Parakeet Realtime EOU 120M
   backend over `parakeet-rs` and ONNX Runtime. It loads one shared model handle
   from the Hugging Face cache and creates independent decoder state per
@@ -56,6 +61,17 @@ stream, and cancel commands plus the
 The provider/text gateway contains no speech state, dependency, command,
 permission, or shutdown path. Ordinary Rust consumers use the same service and
 backend traits without Tauri.
+
+The host lifecycle is one-way: `running -> quiescing -> closed`. Route
+selection and global request-ID reservation occur under the same state lock.
+The shutdown leader closes admission, cancels every exact active route, asks
+every backend to stop, waits for all backend finals, joins every relay monitor,
+and retains the aggregate result for concurrent and repeated callers. The
+Parakeet and Apple adapters likewise retain every `spawn_blocking` join handle;
+neither adapter can report shutdown while its native worker remains alive.
+The Tauri plugin performs this joined shutdown at `RunEvent::Exit`, reports a
+failure rather than discarding it, and repeats the retained operation as a
+drop-time fallback.
 
 Live Tauri transcription has an explicit input half as well as an output event
 half. `speech_transcribe_stream` opens the bounded request, while

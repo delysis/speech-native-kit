@@ -11,10 +11,10 @@ speech-native-router = { path = "../speech-native-router" }
 speech-native-types = { path = "../speech-native-types" }
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true
