@@ -1361,6 +1361,77 @@ impl Drop for SynthesisTicket {
     }
 }
 
+/// Linear evidence that one speech backend cancelled its outstanding work and
+/// joined every worker it owns.
+///
+/// There is deliberately no bare constructor. A backend either surrenders the
+/// join handles it owns to [`Self::join_workers`], which awaits them, or
+/// explicitly attests that it owns none via [`Self::no_owned_workers`]. The
+/// type is neither `Clone` nor `Serialize`: a shutdown fact must not be
+/// duplicated, replayed, or reconstructed from a log line.
+///
+/// A `Stopped` status, an empty request map, or a returned `Ok(())` cannot
+/// manufacture this value.
+#[derive(Debug)]
+#[must_use = "a joined-shutdown fact must be retained; dropping it discards the \
+              only evidence that backend workers actually stopped"]
+pub struct JoinedSpeechBackend {
+    backend_id: String,
+    joined_workers: usize,
+    owned_workers: bool,
+}
+
+impl JoinedSpeechBackend {
+    /// Await every worker the backend owned.
+    ///
+    /// A panicked worker still counts as joined: awaiting its `JoinHandle` has
+    /// already observed the task stop running.
+    pub async fn join_workers(
+        backend_id: impl Into<String>,
+        handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Self {
+        let joined_workers = handles.len();
+        for handle in handles {
+            let _ = handle.await;
+        }
+        Self {
+            backend_id: backend_id.into(),
+            joined_workers,
+            owned_workers: true,
+        }
+    }
+
+    /// Attest that this backend owns no joinable worker of its own.
+    ///
+    /// Use this only for backends whose work is performed by an external
+    /// callback-driven runtime. It is an explicit, auditable claim.
+    pub fn no_owned_workers(backend_id: impl Into<String>) -> Self {
+        Self {
+            backend_id: backend_id.into(),
+            joined_workers: 0,
+            owned_workers: false,
+        }
+    }
+
+    #[must_use]
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
+    }
+
+    /// Number of workers actually awaited.
+    #[must_use]
+    pub const fn worker_count(&self) -> usize {
+        self.joined_workers
+    }
+
+    /// `false` when the backend attested it owns no joinable worker, so this
+    /// value is a declaration rather than an observed join.
+    #[must_use]
+    pub const fn observed_join(&self) -> bool {
+        self.owned_workers
+    }
+}
+
 #[async_trait]
 pub trait SpeechBackend: Send + Sync {
     fn descriptor(&self) -> SpeechBackendDescriptor;
@@ -1371,7 +1442,23 @@ pub trait SpeechBackend: Send + Sync {
     ) -> Result<TranscriptionTicket, SpeechError>;
     async fn synthesize(&self, request: SynthesisRequest) -> Result<SynthesisTicket, SpeechError>;
     fn cancel(&self, request_id: &SpeechRequestId) -> usize;
+    /// Cancel outstanding work and close this backend.
+    ///
+    /// Returning `Ok(())` carries no evidence that a worker stopped. Prefer
+    /// implementing [`Self::shutdown_joined`], which must return proof.
     async fn shutdown(&self) -> Result<(), SpeechError>;
+
+    /// Cancel outstanding work and join every owned worker before returning.
+    ///
+    /// The default implementation delegates to [`Self::shutdown`] and reports
+    /// `no_owned_workers`, which is honest: a backend that only implements the
+    /// legacy method supplies no join evidence. Backends that own workers must
+    /// override this and surrender their handles to
+    /// [`JoinedSpeechBackend::join_workers`].
+    async fn shutdown_joined(&self) -> Result<JoinedSpeechBackend, SpeechError> {
+        self.shutdown().await?;
+        Ok(JoinedSpeechBackend::no_owned_workers(self.descriptor().id))
+    }
 }
 
 fn validate_audio_bytes(data: &[u8], request_id: &SpeechRequestId) -> Result<(), SpeechError> {

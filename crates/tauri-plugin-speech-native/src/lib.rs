@@ -71,7 +71,19 @@ impl Builder {
             .on_drop(|app| {
                 let speech = Arc::clone(&app.state::<SpeechPluginState>().speech);
                 tauri::async_runtime::block_on(async move {
-                    let _ = speech.shutdown().await;
+                    // Block teardown until every backend has cancelled its work
+                    // and joined its workers. Retaining the drain fact is what
+                    // distinguishes "shutdown returned" from "workers stopped".
+                    match speech.shutdown().await {
+                        Ok(joined) => {
+                            debug_assert!(
+                                joined.joined_backends() > 0 || joined.joined_workers() == 0
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("speech gateway shutdown failed during teardown: {error}");
+                        }
+                    }
                 });
             })
             .build()

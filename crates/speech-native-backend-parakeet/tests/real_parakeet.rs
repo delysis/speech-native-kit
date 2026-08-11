@@ -201,5 +201,10 @@ async fn real_gateway_transcription_and_request_scoped_cancellation() {
         1
     );
 
-    gateway.shutdown().await.expect("shutdown speech gateway");
+    let joined = gateway.shutdown().await.expect("shutdown speech gateway");
+    assert_eq!(
+        joined.joined_backends(),
+        1,
+        "the registered Parakeet backend must report a joined shutdown"
+    );
 }
