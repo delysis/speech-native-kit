@@ -12,14 +12,14 @@ use parakeet_rs::{ParakeetEOU, ParakeetEOUHandle};
 use speech_native_types::{
     AcceptedAudio, AssetManager, AudioChunk, AudioInput, CapabilityAvailability,
     CapabilityEvidence, DEFAULT_SPEECH_EVENT_CAPACITY, DiarizationPolicy, EncodedAudioFormat,
-    EvidenceKind, EvidenceOutcome, NetworkBehavior, PcmFormat, PcmSampleFormat, SpeechAsset,
-    SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind, SpeechBackendReadiness,
-    SpeechCancellation, SpeechCapability, SpeechCapabilityLimits, SpeechError, SpeechErrorClass,
-    SpeechModelDescriptor, SpeechOperationCapability, SpeechRequestId, SpeechResolvedRoute,
-    SpeechRouteSelector, SpeechUsage, SynthesisRequest, SynthesisTicket, TimestampGranularity,
-    TranscriptSegment, TranscriptionAudioSink, TranscriptionCapabilities, TranscriptionEvent,
-    TranscriptionInput, TranscriptionRequest, TranscriptionResponse, TranscriptionTask,
-    TranscriptionTicket, UsageProvenance,
+    EvidenceKind, EvidenceOutcome, JoinedSpeechBackend, NetworkBehavior, PcmFormat,
+    PcmSampleFormat, SpeechAsset, SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind,
+    SpeechBackendReadiness, SpeechCancellation, SpeechCapability, SpeechCapabilityLimits,
+    SpeechError, SpeechErrorClass, SpeechModelDescriptor, SpeechOperationCapability,
+    SpeechRequestId, SpeechResolvedRoute, SpeechRouteSelector, SpeechUsage, SynthesisRequest,
+    SynthesisTicket, TimestampGranularity, TranscriptSegment, TranscriptionAudioSink,
+    TranscriptionCapabilities, TranscriptionEvent, TranscriptionInput, TranscriptionRequest,
+    TranscriptionResponse, TranscriptionTask, TranscriptionTicket, UsageProvenance,
 };
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -55,6 +55,11 @@ pub struct ParakeetSpeechBackend {
 struct BackendState {
     active: Mutex<HashMap<SpeechRequestId, Arc<AtomicBool>>>,
     shutting_down: AtomicBool,
+    /// Join handles for transcription workers this backend owns.
+    ///
+    /// Retained so shutdown can await them. Previously each worker was
+    /// detached, so shutdown returned while decode threads were still running.
+    workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 struct BackendCancellation {
@@ -193,7 +198,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
         };
         drop(audio_sender);
 
-        drop(tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             run_transcription(
                 request,
                 model,
@@ -205,7 +210,14 @@ impl SpeechBackend for ParakeetSpeechBackend {
             if let Ok(mut active) = state.active.lock() {
                 active.remove(&worker_id);
             }
-        }));
+        });
+        // Retain the handle so `shutdown_joined` can await it. Finished
+        // handles are pruned here so a long-lived backend does not accumulate
+        // them.
+        if let Ok(mut workers) = self.state.workers.lock() {
+            workers.retain(|handle| !handle.is_finished());
+            workers.push(worker);
+        }
 
         Ok(TranscriptionTicket::new(
             request_id,
@@ -233,6 +245,35 @@ impl SpeechBackend for ParakeetSpeechBackend {
     }
 
     async fn shutdown(&self) -> Result<(), SpeechError> {
+        self.cancel_all_for_shutdown()?;
+        Ok(())
+    }
+
+    /// Cancel every outstanding request, then await every owned worker.
+    ///
+    /// Returning requires real join evidence: the handles are surrendered to
+    /// [`JoinedSpeechBackend::join_workers`], which awaits each one.
+    async fn shutdown_joined(&self) -> Result<JoinedSpeechBackend, SpeechError> {
+        self.cancel_all_for_shutdown()?;
+        let handles = {
+            let mut workers = self.state.workers.lock().map_err(|_| {
+                backend_error(
+                    &SpeechRequestId("parakeet-shutdown".to_string()),
+                    "parakeet_state_unavailable",
+                    SpeechErrorClass::Internal,
+                    true,
+                    "Parakeet worker state is unavailable",
+                )
+            })?;
+            std::mem::take(&mut *workers)
+        };
+        Ok(JoinedSpeechBackend::join_workers(self.descriptor().id, handles).await)
+    }
+}
+
+impl ParakeetSpeechBackend {
+    /// Close admission and flip every outstanding cancellation flag.
+    fn cancel_all_for_shutdown(&self) -> Result<(), SpeechError> {
         self.state.shutting_down.store(true, Ordering::Release);
         let active = self.state.active.lock().map_err(|_| {
             backend_error(

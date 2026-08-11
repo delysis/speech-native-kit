@@ -35,6 +35,8 @@ pub enum SpeechHostError {
     BackendMissing { backend_id: String },
     #[error("one or more speech backends failed during shutdown")]
     Shutdown { failures: Vec<SpeechError> },
+    #[error("speech host admission is closed: {detail}")]
+    AdmissionClosed { detail: String },
 }
 
 impl From<SpeechRouteError> for SpeechHostError {
@@ -55,10 +57,46 @@ pub struct SpeechHostStatus {
     pub backends: Vec<SpeechBackendDescriptor>,
 }
 
+/// Admission phase for a speech gateway.
+///
+/// Admission closes *before* backends are drained, so a request cannot be
+/// dispatched into a backend that is already cancelling its workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPhase {
+    Running,
+    Quiescing,
+    Stopped,
+}
+
+/// Linear evidence that every registered backend was drained and joined.
+///
+/// Like [`JoinedSpeechBackend`], this has no bare constructor: it is produced
+/// only by [`SpeechHost::shutdown`] after every backend returned its own
+/// joined-shutdown fact.
+#[derive(Debug)]
+#[must_use = "process teardown must retain the joined speech-host drain fact"]
+pub struct JoinedSpeechHost {
+    joined_backends: usize,
+    joined_workers: usize,
+}
+
+impl JoinedSpeechHost {
+    #[must_use]
+    pub const fn joined_backends(&self) -> usize {
+        self.joined_backends
+    }
+
+    #[must_use]
+    pub const fn joined_workers(&self) -> usize {
+        self.joined_workers
+    }
+}
+
 pub struct SpeechHost {
     target: PlatformTarget,
     router: SpeechRouter,
     backends: RwLock<BTreeMap<String, Arc<dyn SpeechBackend>>>,
+    phase: RwLock<HostPhase>,
 }
 
 impl std::fmt::Debug for SpeechHost {
@@ -83,10 +121,30 @@ impl SpeechHost {
             target,
             router: SpeechRouter,
             backends: RwLock::new(BTreeMap::new()),
+            phase: RwLock::new(HostPhase::Running),
+        }
+    }
+
+    /// Reject work once admission has closed.
+    fn ensure_running(&self) -> Result<(), SpeechHostError> {
+        let phase = self
+            .phase
+            .read()
+            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        match *phase {
+            HostPhase::Running => Ok(()),
+            HostPhase::Quiescing => Err(SpeechHostError::AdmissionClosed {
+                detail: "speech host admission is closed while shutdown drains backends"
+                    .to_string(),
+            }),
+            HostPhase::Stopped => Err(SpeechHostError::AdmissionClosed {
+                detail: "speech host admission is permanently closed after shutdown".to_string(),
+            }),
         }
     }
 
     pub fn register_backend(&self, backend: Arc<dyn SpeechBackend>) -> Result<(), SpeechHostError> {
+        self.ensure_running()?;
         let descriptor = backend.descriptor();
         descriptor
             .validate()
@@ -157,6 +215,7 @@ impl SpeechHost {
         &self,
         mut request: TranscriptionRequest,
     ) -> Result<TranscriptionTicket, SpeechHostError> {
+        self.ensure_running()?;
         let plan = self.plan_transcription(&request)?;
         pin_route(&mut request.context.route, &plan);
         let backend = self.backend(&plan.selected.route.backend_id)?;
@@ -167,6 +226,7 @@ impl SpeechHost {
         &self,
         mut request: SynthesisRequest,
     ) -> Result<SynthesisTicket, SpeechHostError> {
+        self.ensure_running()?;
         let plan = self.plan_synthesis(&request)?;
         pin_route(&mut request.context.route, &plan);
         let backend = self.backend(&plan.selected.route.backend_id)?;
@@ -183,7 +243,20 @@ impl SpeechHost {
         })
     }
 
-    pub async fn shutdown(&self) -> Result<(), SpeechHostError> {
+    /// Close admission permanently, then drain and join every backend.
+    ///
+    /// Admission is closed *before* any backend is asked to stop, so no request
+    /// can be dispatched into a draining backend. Success returns linear
+    /// evidence that every backend surrendered a joined-shutdown fact; it is
+    /// not merely an absence of errors.
+    pub async fn shutdown(&self) -> Result<JoinedSpeechHost, SpeechHostError> {
+        {
+            let mut phase = self
+                .phase
+                .write()
+                .map_err(|_| SpeechHostError::StateUnavailable)?;
+            *phase = HostPhase::Quiescing;
+        }
         let backends = self
             .backends
             .read()
@@ -192,15 +265,31 @@ impl SpeechHost {
             .cloned()
             .collect::<Vec<_>>();
         let mut failures = Vec::new();
+        let mut joined_backends = 0usize;
+        let mut joined_workers = 0usize;
         for backend in backends {
-            if let Err(error) = backend.shutdown().await {
-                failures.push(error);
+            match backend.shutdown_joined().await {
+                Ok(joined) => {
+                    joined_backends += 1;
+                    joined_workers = joined_workers.saturating_add(joined.worker_count());
+                }
+                Err(error) => failures.push(error),
             }
         }
         if !failures.is_empty() {
             return Err(SpeechHostError::Shutdown { failures });
         }
-        Ok(())
+        {
+            let mut phase = self
+                .phase
+                .write()
+                .map_err(|_| SpeechHostError::StateUnavailable)?;
+            *phase = HostPhase::Stopped;
+        }
+        Ok(JoinedSpeechHost {
+            joined_backends,
+            joined_workers,
+        })
     }
 
     fn backend(&self, backend_id: &str) -> Result<Arc<dyn SpeechBackend>, SpeechHostError> {
@@ -526,5 +615,46 @@ mod tests {
         assert_eq!(healthy.shutdown_calls.load(Ordering::Acquire), 1);
         assert_eq!(first_failure.shutdown_calls.load(Ordering::Acquire), 1);
         assert_eq!(second_failure.shutdown_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_shutdown_returns_joined_evidence() {
+        let gateway = SpeechHost::default();
+        let backend = fixture_backend("joined.tts");
+        gateway
+            .register_backend(backend.clone())
+            .expect("register fixture");
+
+        let joined = gateway.shutdown().await.expect("shutdown must succeed");
+        assert_eq!(joined.joined_backends(), 1);
+        assert_eq!(backend.shutdown_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn admission_closes_permanently_after_shutdown() {
+        let gateway = SpeechHost::default();
+        let backend = fixture_backend("admission.tts");
+        gateway
+            .register_backend(backend.clone())
+            .expect("register fixture");
+        let _joined = gateway.shutdown().await.expect("shutdown must succeed");
+
+        // Registration must not reopen a stopped gateway.
+        let reregister = gateway.register_backend(fixture_backend("late.tts"));
+        assert!(
+            matches!(reregister, Err(SpeechHostError::AdmissionClosed { .. })),
+            "registration after shutdown must fail closed, got {reregister:?}"
+        );
+
+        // Synthesis must not dispatch into a drained backend.
+        let synthesized = gateway.synthesize(request()).await;
+        assert!(
+            matches!(synthesized, Err(SpeechHostError::AdmissionClosed { .. })),
+            "synthesis after shutdown must fail closed"
+        );
+
+        // The backend saw exactly one shutdown and no post-shutdown work.
+        assert_eq!(backend.shutdown_calls.load(Ordering::Acquire), 1);
+        assert_eq!(backend.calls.load(Ordering::Acquire), 0);
     }
 }
