@@ -101,10 +101,29 @@ A second fixture drives the deterministic `apple_tts_audio_empty` domain error
 and verifies the operation lease self-reaps while the supervisor retains no
 task failure. These are worker-lifecycle tests; they do not synthesize speech.
 
-A fresh launched Apple acceptance run built from the immutable commit remains
-required before claiming current-source launched acceptance. It should record
-the source revision and executable identity and must keep completed-synthesis
-launch evidence distinct from active-operation shutdown evidence.
+## Current-source launched Tauri Apple WAV
+
+At `2026-08-11T22:52:13Z`, the same disposable hidden Tauri 2 consumer was
+rebuilt in release mode with path dependencies resolving to exact Rust source
+commit `34bc0276c41ba5a8f1a4d53619db63ba51a82cb6`:
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release
+./target/release/speech-r2-tauri-smoke
+```
+
+The arm64 executable was 12,261,344 bytes with SHA-256
+`9dab95f43a7172ff431af118622c29798168895f4b8c7de163cad1ff9ebb3075`.
+It exited 0 and reported one real local Apple terminal with no fixture:
+
+```text
+APPLE_TAURI_SMOKE_OK request_id=apple-launched-tauri-r2 backend=apple.av-speech voice=com.apple.eloquence.en-US.Eddy wav_bytes=181216 terminal_events=1 network=never real_local_inference=true fake_fixture=false
+```
+
+This proves launched current-source completion and a real Apple WAV. Active
+operation cancellation and joined shutdown remain separately established by
+the deterministic owned-worker test above; the launched smoke completed its
+synthesis before normal application exit.
 
 ## Repository gates
 
