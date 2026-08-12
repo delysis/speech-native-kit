@@ -279,15 +279,24 @@ impl TaskSupervisor {
             .checked_add(1)
             .ok_or(TaskSupervisorError::StateUnavailable)?;
         let sequence = state.next_worker_sequence;
-        state.next_worker_sequence = sequence
+        let next_worker_sequence = sequence
             .checked_add(1)
             .ok_or(TaskSupervisorError::StateUnavailable)?;
+        if state.active == 0 {
+            // Begin a new bounded work epoch. Exact identities remain
+            // available for the most recently exercised concurrent epoch,
+            // while completed process-lifetime history is represented only
+            // by the checked admitted/completed counters.
+            state.expected_worker_ids.clear();
+            state.joined_worker_ids.clear();
+        }
         let worker_id = format!("{}:task-{sequence}:{label}", self.scope);
         if !state.expected_worker_ids.insert(worker_id.clone()) {
             return Err(TaskSupervisorError::StateUnavailable);
         }
         state.active = active;
         state.admitted_tasks = admitted_tasks;
+        state.next_worker_sequence = next_worker_sequence;
         Ok(worker_id)
     }
 
@@ -449,6 +458,32 @@ mod tests {
                 .state
                 .lock()
                 .expect("read reaped join handles")
+                .join_handles
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_running_history_is_bounded_before_shutdown_epoch() {
+        let supervisor = Arc::new(TaskSupervisor::with_scope("bounded-history"));
+        for sequence in 0..10_000 {
+            supervisor
+                .spawn(format!("short-{sequence}"), async { Ok(()) })
+                .expect("spawn short task");
+            supervisor.wait_for_idle().await.expect("join short task");
+        }
+
+        let snapshot = supervisor.snapshot().expect("bounded snapshot");
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.admitted_tasks, 10_000);
+        assert_eq!(snapshot.completed_tasks, 10_000);
+        assert_eq!(snapshot.expected_worker_ids.len(), 1);
+        assert_eq!(snapshot.joined_worker_ids, snapshot.expected_worker_ids);
+        assert!(
+            supervisor
+                .state
+                .lock()
+                .expect("bounded supervisor state")
                 .join_handles
                 .is_empty()
         );

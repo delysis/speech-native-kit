@@ -306,7 +306,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
     }
 
     async fn shutdown(&self) -> Result<(), SpeechError> {
-        let leader = {
+        let start = {
             let mut data = self.state.data.lock().map_err(|_| state_error())?;
             match data.phase {
                 BackendPhase::Running => {
@@ -325,42 +325,10 @@ impl SpeechBackend for ParakeetSpeechBackend {
                 }
             }
         };
-        if !leader {
-            return wait_for_backend_shutdown(&self.state).await;
+        if start {
+            spawn_backend_shutdown(Arc::clone(&self.state));
         }
-
-        self.state.tasks.begin_shutdown().map_err(|error| {
-            task_supervisor_error(&SpeechRequestId("parakeet-shutdown".to_string()), error)
-        })?;
-        self.state.tasks.wait_for_idle().await.map_err(|error| {
-            task_supervisor_error(&SpeechRequestId("parakeet-shutdown".to_string()), error)
-        })?;
-        let result = self
-            .state
-            .tasks
-            .failure_summary()
-            .map_err(|error| task_supervisor_error(&SpeechRequestId("parakeet-shutdown".to_string()), error))?
-            .map_or(Ok(()), |summary| {
-                let additional = summary.additional_failures;
-                let first = summary.first;
-                Err(backend_error(
-                    &SpeechRequestId("parakeet-shutdown".to_string()),
-                    "parakeet_worker_failed",
-                    SpeechErrorClass::Internal,
-                    false,
-                    &format!(
-                        "Parakeet worker '{}' failed ({:?}): {}; {additional} additional failure(s)",
-                        first.label, first.kind, first.detail
-                    ),
-                ))
-            });
-        {
-            let mut data = self.state.data.lock().map_err(|_| state_error())?;
-            data.shutdown_result = Some(result.clone());
-            data.phase = BackendPhase::Closed;
-        }
-        self.state.changed.notify_waiters();
-        result
+        wait_for_backend_shutdown(&self.state).await
     }
 }
 
@@ -459,6 +427,8 @@ impl Drop for BackendOperationLease {
 async fn wait_for_backend_shutdown(state: &BackendState) -> Result<(), SpeechError> {
     loop {
         let changed = state.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
         let result = {
             let data = state.data.lock().map_err(|_| state_error())?;
             (data.phase == BackendPhase::Closed).then(|| data.shutdown_result.clone())
@@ -468,6 +438,67 @@ async fn wait_for_backend_shutdown(state: &BackendState) -> Result<(), SpeechErr
         }
         changed.await;
     }
+}
+
+fn spawn_backend_shutdown(state: Arc<BackendState>) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        publish_backend_shutdown(&state, Err(state_error()));
+        return;
+    };
+    runtime.spawn(async move {
+        let worker_state = Arc::clone(&state);
+        let joined = tokio::spawn(async move { run_backend_shutdown(&worker_state).await }).await;
+        let result = joined.unwrap_or_else(|error| {
+            Err(backend_error(
+                &SpeechRequestId("parakeet-shutdown".to_owned()),
+                "parakeet_shutdown_panicked",
+                SpeechErrorClass::Internal,
+                false,
+                &format!("Parakeet shutdown coordinator panicked: {error}"),
+            ))
+        });
+        publish_backend_shutdown(&state, result);
+    });
+}
+
+async fn run_backend_shutdown(state: &BackendState) -> Result<(), SpeechError> {
+    let request_id = SpeechRequestId("parakeet-shutdown".to_owned());
+    state
+        .tasks
+        .begin_shutdown()
+        .map_err(|error| task_supervisor_error(&request_id, error))?;
+    state
+        .tasks
+        .wait_for_idle()
+        .await
+        .map_err(|error| task_supervisor_error(&request_id, error))?;
+    state
+        .tasks
+        .failure_summary()
+        .map_err(|error| task_supervisor_error(&request_id, error))?
+        .map_or(Ok(()), |summary| {
+            Err(backend_error(
+                &request_id,
+                "parakeet_worker_failed",
+                SpeechErrorClass::Internal,
+                false,
+                &format!(
+                    "Parakeet worker '{}' failed ({:?}): {}; {} additional failure(s)",
+                    summary.first.label,
+                    summary.first.kind,
+                    summary.first.detail,
+                    summary.additional_failures
+                ),
+            ))
+        })
+}
+
+fn publish_backend_shutdown(state: &BackendState, result: Result<(), SpeechError>) {
+    if let Ok(mut data) = state.data.lock() {
+        data.shutdown_result = Some(result);
+        data.phase = BackendPhase::Closed;
+    }
+    state.changed.notify_waiters();
 }
 
 fn state_error() -> SpeechError {
@@ -1478,6 +1509,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborted_shutdown_caller_and_concurrent_followers_complete() {
+        let backend = ParakeetSpeechBackend::unavailable(asset_required_descriptor());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        backend
+            .state
+            .spawn_operation(
+                SpeechRequestId("abort-safe-parakeet".to_owned()),
+                Arc::clone(&cancelled),
+                None,
+                move || {
+                    started_sender.send(()).expect("signal worker start");
+                    release_receiver.recv().expect("release blocking worker");
+                },
+            )
+            .expect("spawn blocking fixture worker");
+        started_receiver.recv().expect("worker starts");
+
+        let first_backend = backend.clone();
+        let first = tokio::spawn(async move { first_backend.shutdown().await });
+        tokio::task::yield_now().await;
+        first.abort();
+        first.await.expect_err("first shutdown caller is aborted");
+        let followers = (0..32)
+            .map(|_| {
+                let follower = backend.clone();
+                tokio::spawn(async move { follower.shutdown().await })
+            })
+            .collect::<Vec<_>>();
+        assert!(cancelled.load(Ordering::Acquire));
+        release_sender.send(()).expect("release worker");
+        for follower in followers {
+            tokio::time::timeout(std::time::Duration::from_secs(2), follower)
+                .await
+                .expect("follower does not miss close notification")
+                .expect("follower joins")
+                .expect("retained shutdown succeeds");
+        }
+    }
+
+    #[tokio::test]
     async fn stream_sink_rejects_push_after_finish() {
         let request_id = SpeechRequestId("finished-stream".to_string());
         let (sender, _receiver) = mpsc::channel(1);
@@ -1567,6 +1640,19 @@ mod tests {
         let task_state = state.tasks.snapshot().expect("read task state");
         assert_eq!(task_state.active, 0);
         assert_eq!(task_state.retained_failures, 0);
+        assert!(task_state.expected_worker_ids.len() <= 1_000);
+        assert_eq!(
+            task_state
+                .joined_worker_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            task_state
+                .expected_worker_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     #[tokio::test]

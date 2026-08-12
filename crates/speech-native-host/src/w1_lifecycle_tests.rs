@@ -712,23 +712,27 @@ impl SpeechBridgeAdapter {
             return Err("terminal projection mismatch".to_owned());
         }
         self.runtime.block_on(async {
-            for _ in 0..1000 {
-                let suffix = format!(":host-final-relay:{}", operation.request_id);
-                if self
-                    .host
-                    .lifecycle
-                    .tasks
-                    .snapshot()
-                    .map_err(|error| error.to_string())?
-                    .joined_worker_ids
-                    .iter()
-                    .any(|id| id.ends_with(&suffix))
-                {
-                    return Ok(());
+            tokio::time::timeout(timeout, async {
+                loop {
+                    let suffix = format!(":host-final-relay:{}", operation.request_id);
+                    let state = self
+                        .host
+                        .lifecycle
+                        .tasks
+                        .snapshot()
+                        .map_err(|error| error.to_string())?;
+                    if state
+                        .joined_worker_ids
+                        .iter()
+                        .any(|id| id.ends_with(&suffix))
+                    {
+                        return Ok::<(), String>(());
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-            Err("host final relay did not reap".to_owned())
+            })
+            .await
+            .map_err(|_| "host final relay did not reap".to_owned())?
         })?;
         Ok(snapshot)
     }
