@@ -6,12 +6,25 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+unstable-w1-contract-tests = [
+    "dep:platform-contract-testkit",
+    "dep:platform-contracts-v0",
+    "dep:sha2",
+    "dep:serde_json",
+]
+
 [dependencies]
 speech-native-router = { path = "../speech-native-router" }
 speech-native-types = { path = "../speech-native-types" }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
+platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
+sha2 = { version = "0.10.9", optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true
