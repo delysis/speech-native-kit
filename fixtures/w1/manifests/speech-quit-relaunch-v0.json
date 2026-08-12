@@ -7,8 +7,8 @@
     "case_id": "speech.quit_relaunch_fake_owners.v1",
     "source": {
       "repository_id": "delysis/speech-native-kit",
-      "commit": "368196350803ac0a798fab142cd6cdc64b7e6fb6",
-      "production_tree": {"id": "speech.quit_relaunch.production_tree.3681963", "digest": {"algorithm": "sha256", "hex": "83023ccb827143b1cfe76a8927902248f1d9174728f8c015117dfecedbd3f4c2"}, "length": 375}
+      "commit": "2c427e39ee07c944e0ef51d471729fb676e2f62a",
+      "production_tree": {"id": "speech.quit_relaunch.production_tree.2c427e3", "digest": {"algorithm": "sha256", "hex": "0884be8cae9b736952371a32191ddbec66d11599a5e253eac165d0d2c42d1229"}, "length": 375}
     },
     "inputs": [{
       "identity": {"id": "speech.quit_relaunch.input.v1", "digest": {"algorithm": "sha256", "hex": "98870bbca46ecd37a0caf5fdeb2f0ce5c8c92a652b13fb5bfc801f43ef160264"}, "length": 317},
@@ -23,7 +23,7 @@
       "required_environment": [],
       "network": "denied"
     }],
-    "expected_projection": {"id": "speech.quit_relaunch.expected_projection.v1", "digest": {"algorithm": "sha256", "hex": "cfd2d752a83fe67a44b58157dac43decbd8b52e3b89895a1588d507fff4bca07"}, "length": 2776}
+    "expected_projection": {"id": "speech.quit_relaunch.expected_projection.v1", "digest": {"algorithm": "sha256", "hex": "0e1570e7aab1363fbe2039e0c9e2582d85e7d2c08846b3d3c771d5ef4f3a47a5"}, "length": 3836}
   }],
   "omitted_claims": [
     "operating-system process relaunch",

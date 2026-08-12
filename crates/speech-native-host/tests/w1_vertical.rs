@@ -43,7 +43,7 @@ use tokio::sync::{mpsc, oneshot};
 const BASELINE_COMMIT: &str = "89146595df7ba893ddd704a811377f6cb14856bc";
 const PRODUCTION_TREE: &[u8] =
     include_bytes!("../../../fixtures/w1/source/speech-production-tree-8914659.json");
-const QUIT_RELAUNCH_BASELINE_COMMIT: &str = "368196350803ac0a798fab142cd6cdc64b7e6fb6";
+const QUIT_RELAUNCH_BASELINE_COMMIT: &str = "2c427e39ee07c944e0ef51d471729fb676e2f62a";
 const QUIT_RELAUNCH_INPUT: &[u8] =
     include_bytes!("../../../fixtures/w1/speech-quit-relaunch-v1.json");
 const QUIT_RELAUNCH_MANIFEST: &[u8] =
@@ -51,7 +51,7 @@ const QUIT_RELAUNCH_MANIFEST: &[u8] =
 const QUIT_RELAUNCH_PROJECTION: &[u8] =
     include_bytes!("../../../fixtures/w1/projections/speech-quit-relaunch-v1.json");
 const QUIT_RELAUNCH_SOURCE: &[u8] =
-    include_bytes!("../../../fixtures/w1/source/speech-quit-relaunch-production-tree-3681963.json");
+    include_bytes!("../../../fixtures/w1/source/speech-quit-relaunch-production-tree-2c427e3.json");
 #[cfg(feature = "unstable-w1-contract-tests")]
 const RECEIPT_SCHEMA: &str = "delysis.speech.fake_owner_receipt.v0";
 #[cfg(feature = "unstable-w1-contract-tests")]
@@ -91,7 +91,7 @@ fn fixture_bytes(relative_path: &str) -> &'static [u8] {
             include_bytes!("../../../fixtures/w1/projections/speech-peer-cancellation-v1.json")
         }
         "projections/speech-quit-relaunch-v1.json" => QUIT_RELAUNCH_PROJECTION,
-        "source/speech-quit-relaunch-production-tree-3681963.json" => QUIT_RELAUNCH_SOURCE,
+        "source/speech-quit-relaunch-production-tree-2c427e3.json" => QUIT_RELAUNCH_SOURCE,
         "source/speech-production-tree-8914659.json" => PRODUCTION_TREE,
         "speech-peer-cancellation-v1.json" => {
             include_bytes!("../../../fixtures/w1/speech-peer-cancellation-v1.json")
@@ -859,17 +859,44 @@ async fn w1_quit_relaunch_fake_owners_projection() {
         .await
         .expect("detached coordinator must finish")
         .expect("retained shutdown result succeeds");
-    let quit_summary = quit_host
-        .w1_contract_adapter()
+    let quit_adapter = quit_host.w1_contract_adapter();
+    let quit_summary = quit_adapter
         .closed_summary()
         .expect("project closed quit host");
+    let (quit_host_expected_worker_ids, quit_host_joined_worker_ids) = quit_adapter
+        .closed_host_worker_ids()
+        .expect("retain exact closed quit-host worker IDs");
     quit_summary.validate().expect("validate closed quit host");
     assert_eq!(quit_summary.active_operations, 0);
     assert_eq!(quit_summary.retained_tasks, 0);
     assert_eq!(quit_summary.expected_workers, 1);
     assert_eq!(quit_summary.joined_workers, 1);
+    let quit_host_worker_id = format!(
+        "task-supervisor:task-1:host-final-relay:{}",
+        input.quit_request_id
+    );
+    assert_eq!(
+        quit_host_expected_worker_ids.as_slice(),
+        std::slice::from_ref(&quit_host_worker_id)
+    );
+    assert_eq!(
+        quit_host_joined_worker_ids.as_slice(),
+        std::slice::from_ref(&quit_host_worker_id)
+    );
     let quit_workers = quit_backend.snapshot();
     assert!(exact_worker_sets(&quit_workers));
+    let quit_backend_worker_id = format!(
+        "w1-speech-quit-owner:task-1:request:{}",
+        input.quit_request_id
+    );
+    assert_eq!(
+        quit_workers.expected_worker_ids.as_slice(),
+        std::slice::from_ref(&quit_backend_worker_id)
+    );
+    assert_eq!(
+        quit_workers.joined_worker_ids.as_slice(),
+        std::slice::from_ref(&quit_backend_worker_id)
+    );
     assert!(!quit_backend.owner_alive.load(Ordering::Acquire));
     let quit_store_bytes = quit_store
         .lock()
@@ -939,10 +966,13 @@ async fn w1_quit_relaunch_fake_owners_projection() {
         .shutdown()
         .await
         .expect("fresh runtime joins cleanly");
-    let relaunch_summary = relaunch_host
-        .w1_contract_adapter()
+    let relaunch_adapter = relaunch_host.w1_contract_adapter();
+    let relaunch_summary = relaunch_adapter
         .closed_summary()
         .expect("project closed relaunch host");
+    let (relaunch_host_expected_worker_ids, relaunch_host_joined_worker_ids) = relaunch_adapter
+        .closed_host_worker_ids()
+        .expect("retain exact closed relaunch-host worker IDs");
     relaunch_summary
         .validate()
         .expect("validate closed relaunch host");
@@ -950,8 +980,32 @@ async fn w1_quit_relaunch_fake_owners_projection() {
     assert_eq!(relaunch_summary.retained_tasks, 0);
     assert_eq!(relaunch_summary.expected_workers, 1);
     assert_eq!(relaunch_summary.joined_workers, 1);
+    let relaunch_host_worker_id = format!(
+        "task-supervisor:task-1:host-final-relay:{}",
+        input.relaunch_request_id
+    );
+    assert_eq!(
+        relaunch_host_expected_worker_ids.as_slice(),
+        std::slice::from_ref(&relaunch_host_worker_id)
+    );
+    assert_eq!(
+        relaunch_host_joined_worker_ids.as_slice(),
+        std::slice::from_ref(&relaunch_host_worker_id)
+    );
     let relaunch_workers = relaunch_backend.snapshot();
     assert!(exact_worker_sets(&relaunch_workers));
+    let relaunch_backend_worker_id = format!(
+        "w1-speech-relaunch-owner:task-1:request:{}",
+        input.relaunch_request_id
+    );
+    assert_eq!(
+        relaunch_workers.expected_worker_ids.as_slice(),
+        std::slice::from_ref(&relaunch_backend_worker_id)
+    );
+    assert_eq!(
+        relaunch_workers.joined_worker_ids.as_slice(),
+        std::slice::from_ref(&relaunch_backend_worker_id)
+    );
     assert!(!relaunch_backend.owner_alive.load(Ordering::Acquire));
     assert_ne!(
         quit_workers.expected_worker_ids, relaunch_workers.expected_worker_ids,
@@ -1019,6 +1073,14 @@ async fn w1_quit_relaunch_fake_owners_projection() {
             "fresh_host_and_backend": {"kind": "boolean", "value": true},
             "model_inference_invoked": {"kind": "boolean", "value": false},
             "post_relaunch_completed": {"kind": "boolean", "value": true},
+            "quit_backend_expected_worker_ids": {"kind": "text", "value": quit_backend_worker_id},
+            "quit_backend_joined_worker_ids": {"kind": "text", "value": quit_workers.joined_worker_ids.join(",")},
+            "quit_host_expected_worker_ids": {"kind": "text", "value": quit_host_worker_id},
+            "quit_host_joined_worker_ids": {"kind": "text", "value": quit_host_joined_worker_ids.join(",")},
+            "relaunch_backend_expected_worker_ids": {"kind": "text", "value": relaunch_backend_worker_id},
+            "relaunch_backend_joined_worker_ids": {"kind": "text", "value": relaunch_workers.joined_worker_ids.join(",")},
+            "relaunch_host_expected_worker_ids": {"kind": "text", "value": relaunch_host_worker_id},
+            "relaunch_host_joined_worker_ids": {"kind": "text", "value": relaunch_host_joined_worker_ids.join(",")},
             "same_durable_store_reopened": {"kind": "boolean", "value": true},
             "worker_id_sets_match": {"kind": "boolean", "value": expected_workers == joined_workers}
         },
@@ -1449,7 +1511,7 @@ fn w1_model_free_baseline_authenticates_exact_bytes() {
 }
 
 #[test]
-fn w1_fixture_descendant_preserves_every_bound_production_source_root() {
+fn w1_fixture_descendant_changes_only_feature_gated_contract_adapter() {
     let descriptor: ProductionTreeDescriptor =
         serde_json::from_slice(PRODUCTION_TREE).expect("parse production-tree descriptor");
     assert_eq!(descriptor.commit, BASELINE_COMMIT);
@@ -1467,6 +1529,26 @@ fn w1_fixture_descendant_preserves_every_bound_production_source_root() {
         "fixture commit must descend from baseline"
     );
     for (source_root, expected_oid) in descriptor.source_roots {
+        if source_root == "crates/speech-native-host/src" {
+            assert!(
+                Command::new("git")
+                    .args([
+                        "diff",
+                        "--quiet",
+                        BASELINE_COMMIT,
+                        "HEAD",
+                        "--",
+                        &source_root,
+                        ":(exclude)crates/speech-native-host/src/w1_contracts.rs",
+                    ])
+                    .current_dir(repository)
+                    .status()
+                    .expect("compare production host source outside the W1 adapter")
+                    .success(),
+                "host production source outside the feature-gated W1 adapter changed"
+            );
+            continue;
+        }
         let output = Command::new("git")
             .args(["rev-parse", &format!("HEAD:{source_root}")])
             .current_dir(repository)

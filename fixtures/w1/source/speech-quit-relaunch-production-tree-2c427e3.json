@@ -1,10 +1,10 @@
 {
   "schema": "delysis.production_source_roots.v0",
   "repository_id": "delysis/speech-native-kit",
-  "commit": "368196350803ac0a798fab142cd6cdc64b7e6fb6",
+  "commit": "2c427e39ee07c944e0ef51d471729fb676e2f62a",
   "git_object_format": "sha1",
   "source_roots": {
-    "crates/speech-native-host/src": "8681d7fdc7ed26f4bc41763262e87761f9afa211",
+    "crates/speech-native-host/src": "028ff1963324075162c016214c4aadd14eea108c",
     "crates/speech-native-types/src": "f36ec14df209c0155d59fe8889473181b8d63c74"
   }
 }
