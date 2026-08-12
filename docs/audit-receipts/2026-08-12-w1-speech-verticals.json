@@ -1,0 +1,35 @@
+{
+  "schema": "delysis.w1_speech_vertical_receipt.v1",
+  "baseline_commit": "89146595df7ba893ddd704a811377f6cb14856bc",
+  "lifecycle_contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "vertical_protocol_revision": "fc24ffff08c52690390b4460f44617d5d9732563",
+  "fixture_ledger_sha256": "131c47a896383f25928d55ce1f6cc51652efb8946bb12f48d9678133f4d47708",
+  "manifests": {
+    "speech_peer_cancellation": "195fb1aea788c2b93180f853e90acaa19b087544e48773fe4656a0d8bedfe7e9",
+    "current_parakeet_model_audio": "b181cc24a624deb1e9ea9348b55bfc58fa920faf571ee6c2ae48e791eb96d103",
+    "apple_installed_voice": "cc6fe0586f95f373025568a071147d2aa27d6d276939acc3600005263a8cbbc7"
+  },
+  "parakeet": {
+    "model_bundle_sha256": "c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756",
+    "model_bundle_byte_len": 480708981,
+    "audio_sha256": "326d6723b8bcd7ae63cdff4a2c3e536a29a9d3a44e30f9dca7b65e58a9b4aa34",
+    "audio_byte_len": 305580,
+    "real_replay_passed": true,
+    "negative_accuracy_result_retained": true
+  },
+  "apple": {
+    "os_product_version": "15.6",
+    "os_build": "24G84",
+    "darwin_release": "24.6.0",
+    "architecture": "arm64",
+    "installed_voice_count": 191,
+    "voice_identifier": "com.apple.eloquence.en-US.Eddy",
+    "language": "en-US",
+    "quality": "normal",
+    "launched_tauri_exit_code": 0,
+    "executable_sha256": "492296f764ee943007d34541b3883b0d012b70009bb297b654f3cc66e935349a",
+    "executable_byte_len": 11499376,
+    "observed_wav_byte_len": 153540,
+    "wav_byte_equality_required": false
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "ordered_events": [
+    {"sequence": 0, "operation_id": "parakeet-complete", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "kind": "completed", "payload": null},
+    {"sequence": 1, "operation_id": "parakeet-stream", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "kind": "completed", "payload": null},
+    {"sequence": 2, "operation_id": "parakeet-cancelled", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "kind": "cancelled", "payload": null},
+    {"sequence": 3, "operation_id": "parakeet-peer", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "kind": "completed", "payload": null}
+  ],
+  "durable_state": [{
+    "state_id": "speech.host.active_routes",
+    "schema_id": "speech.host.active_routes.v1",
+    "before": {"id": "speech.active_routes.empty.before", "digest": {"algorithm": "sha256", "hex": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}, "length": 2},
+    "after": {"id": "speech.active_routes.empty.before", "digest": {"algorithm": "sha256", "hex": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}, "length": 2},
+    "disposition": "unchanged"
+  }],
+  "lifecycle": [
+    {"operation_id": "parakeet-complete", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "terminal": "completed", "released": true},
+    {"operation_id": "parakeet-stream", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "terminal": "completed", "released": true},
+    {"operation_id": "parakeet-cancelled", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "terminal": "cancelled", "released": true},
+    {"operation_id": "parakeet-peer", "attempt_id": "attempt-1", "correlation_id": "parakeet-real-v1", "terminal": "completed", "released": true}
+  ],
+  "ownership": {"active_operations": 0, "retained_tasks": 0, "expected_workers": 0, "joined_workers": 0},
+  "output_facts": {
+    "backend_id": {"kind": "text", "value": "parakeet.embedded"},
+    "cancel_count": {"kind": "integer", "value": 1},
+    "cancellation_schedule": {"kind": "text", "value": "after_two_peer_admissions_before_terminal_drain"},
+    "complete_transcript_acceptance": {"kind": "text", "value": "non_empty_utf8"},
+    "known_negative_result_retained": {"kind": "boolean", "value": true},
+    "model_load_ms_after_discovery": {"kind": "integer", "value": 0},
+    "network": {"kind": "text", "value": "never"},
+    "peer_completed_non_empty": {"kind": "boolean", "value": true},
+    "real_local_inference": {"kind": "boolean", "value": true},
+    "streaming_transcript_acceptance": {"kind": "text", "value": "non_empty_utf8"}
+  },
+  "fail_closed_facts": [
+    "the cancelled request cannot become completed",
+    "one peer cancellation cannot cancel the other request"
+  ]
+}

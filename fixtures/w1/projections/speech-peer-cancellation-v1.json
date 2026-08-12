@@ -1,0 +1,31 @@
+{
+  "ordered_events": [
+    {"sequence": 0, "operation_id": "speech-peer-cancelled", "attempt_id": "attempt-1", "correlation_id": "speech-peer-fixture", "kind": "cancelled", "payload": null},
+    {"sequence": 1, "operation_id": "speech-peer-completed", "attempt_id": "attempt-1", "correlation_id": "speech-peer-fixture", "kind": "completed", "payload": null}
+  ],
+  "durable_state": [{
+    "state_id": "speech.host.active_routes",
+    "schema_id": "speech.host.active_routes.v1",
+    "before": {"id": "speech.active_routes.empty.before", "digest": {"algorithm": "sha256", "hex": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}, "length": 2},
+    "after": {"id": "speech.active_routes.empty.before", "digest": {"algorithm": "sha256", "hex": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"}, "length": 2},
+    "disposition": "unchanged"
+  }],
+  "lifecycle": [
+    {"operation_id": "speech-peer-cancelled", "attempt_id": "attempt-1", "correlation_id": "speech-peer-fixture", "terminal": "cancelled", "released": true},
+    {"operation_id": "speech-peer-completed", "attempt_id": "attempt-1", "correlation_id": "speech-peer-fixture", "terminal": "completed", "released": true}
+  ],
+  "ownership": {"active_operations": 0, "retained_tasks": 0, "expected_workers": 0, "joined_workers": 0},
+  "output_facts": {
+    "cancel_count": {"kind": "integer", "value": 1},
+    "cancelled_backend": {"kind": "text", "value": "fixture-a.tts"},
+    "cancelled_terminal_count": {"kind": "integer", "value": 1},
+    "peer_backend": {"kind": "text", "value": "fixture-b.tts"},
+    "peer_completed": {"kind": "boolean", "value": true},
+    "peer_terminal_count": {"kind": "integer", "value": 1},
+    "shutdown_joined": {"kind": "boolean", "value": true}
+  },
+  "fail_closed_facts": [
+    "cancellation is scoped to the selected request identity",
+    "shutdown leaves no active operation or retained task"
+  ]
+}

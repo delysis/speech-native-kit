@@ -1,0 +1,32 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "apple_installed_voice",
+  "class": "real",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "speech.apple.installed.voice.v1",
+    "source": {
+      "repository_id": "delysis/speech-native-kit",
+      "commit": "89146595df7ba893ddd704a811377f6cb14856bc",
+      "production_tree": {"id": "speech.production.source_roots.8914659", "digest": {"algorithm": "sha256", "hex": "456bac46ea089a84f659208701408d45380ebaa88f68a1f2311f429bc7cb5c29"}, "length": 725}
+    },
+    "inputs": [{
+      "identity": {"id": "speech.apple.inventory.input.v1", "digest": {"algorithm": "sha256", "hex": "1876752bcb43b7ac212aea8be5dd1dfa96e8bc004cfb9dd3c37ae17c48648049"}, "length": 570},
+      "availability": "runtime_inventory",
+      "relative_path": null
+    }],
+    "state_identities": [],
+    "prerequisites": [{
+      "prerequisite_id": "voice.apple.installed",
+      "kind": "platform_inventory",
+      "identity": {"id": "speech.apple.installed.voice.inventory.v1", "digest": {"algorithm": "sha256", "hex": "1876752bcb43b7ac212aea8be5dd1dfa96e8bc004cfb9dd3c37ae17c48648049"}, "length": 570}
+    }],
+    "replay": [
+      {"program": {"kind": "cargo"}, "argv": ["test", "--locked", "-p", "speech-native-platform", "--test", "w1_apple_voice", "w1_exact_installed_voice_inventory", "--features", "unstable-w1-vertical-tests", "--", "--exact"], "required_environment": [], "network": "denied"},
+      {"program": {"kind": "cargo"}, "argv": ["run", "--locked", "--release", "--manifest-path", "tests/apple-tauri-w1/Cargo.toml"], "required_environment": ["MACOSX_DEPLOYMENT_TARGET"], "network": "denied"}
+    ],
+    "expected_projection": {"id": "speech.apple.expected_projection.v1", "digest": {"algorithm": "sha256", "hex": "3972b70477d65fedf75ce7c7d16243f357118c0fb0311a438318c593a07b14d4"}, "length": 1926}
+  }],
+  "omitted_claims": ["WAV byte equality across operating-system synthesis revisions", "microphone or speech-recognition permission"],
+  "negative_evidence": []
+}

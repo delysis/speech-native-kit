@@ -1,0 +1,22 @@
+{
+  "schema": "delysis.apple_installed_voice_inventory.v1",
+  "observed_host": {
+    "product_name": "macOS",
+    "product_version": "15.6",
+    "build_version": "24G84",
+    "darwin_release": "24.6.0",
+    "architecture": "arm64"
+  },
+  "backend_id": "apple.av-speech",
+  "backend_readiness": "ready",
+  "installed_voice_count": 191,
+  "selected_voice": {
+    "identifier": "com.apple.eloquence.en-US.Eddy",
+    "name": "Eddy",
+    "language": "en-US",
+    "quality": "normal",
+    "network": "never",
+    "installed": true
+  },
+  "inventory_is_noninteractive": true
+}
