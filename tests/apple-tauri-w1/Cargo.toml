@@ -1,0 +1,16 @@
+[package]
+name = "speech-apple-tauri-w1"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+speech-native-platform = { path = "../../crates/speech-native-platform" }
+speech-native-types = { path = "../../crates/speech-native-types" }
+tauri = "2"
+tauri-plugin-speech-native = { path = "../../crates/tauri-plugin-speech-native" }
+
+[build-dependencies]
+tauri-build = "2"
+
+[workspace]

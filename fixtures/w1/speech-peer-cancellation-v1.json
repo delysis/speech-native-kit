@@ -1,0 +1,16 @@
+{
+  "schema": "delysis.speech_peer_cancellation_fixture.v1",
+  "backends": ["fixture-a.tts", "fixture-b.tts"],
+  "requests": [
+    {"request_id": "speech-peer-cancelled", "backend_id": "fixture-a.tts"},
+    {"request_id": "speech-peer-completed", "backend_id": "fixture-b.tts"}
+  ],
+  "schedule": [
+    "admit speech-peer-cancelled",
+    "admit speech-peer-completed",
+    "cancel speech-peer-cancelled",
+    "complete speech-peer-completed",
+    "observe both authoritative finals",
+    "shutdown and join both backends"
+  ]
+}

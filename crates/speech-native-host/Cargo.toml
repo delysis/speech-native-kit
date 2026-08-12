@@ -14,6 +14,11 @@ unstable-w1-contract-tests = [
     "dep:sha2",
     "dep:serde_json",
 ]
+unstable-w1-vertical-tests = [
+    "dep:platform-vertical-fixtures-v0",
+    "dep:sha2",
+    "dep:serde_json",
+]
 
 [dependencies]
 speech-native-router = { path = "../speech-native-router" }
@@ -23,6 +28,7 @@ thiserror.workspace = true
 tokio.workspace = true
 platform-contract-testkit = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
 platform-contracts-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "cbab33555ab9355a6ac453d659c55ec9e0666821", optional = true }
+platform-vertical-fixtures-v0 = { git = "https://github.com/delysis/w1-platform-contracts", rev = "fc24ffff08c52690390b4460f44617d5d9732563", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 serde_json = { workspace = true, optional = true }
 

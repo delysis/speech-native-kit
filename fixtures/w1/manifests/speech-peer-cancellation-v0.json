@@ -1,0 +1,30 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "speech_peer_cancellation",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "speech.peer.cancellation.v1",
+    "source": {
+      "repository_id": "delysis/speech-native-kit",
+      "commit": "89146595df7ba893ddd704a811377f6cb14856bc",
+      "production_tree": {"id": "speech.production.source_roots.8914659", "digest": {"algorithm": "sha256", "hex": "456bac46ea089a84f659208701408d45380ebaa88f68a1f2311f429bc7cb5c29"}, "length": 725}
+    },
+    "inputs": [{
+      "identity": {"id": "speech.peer.cancellation.input.v1", "digest": {"algorithm": "sha256", "hex": "5a9040c6e5f0174cb3303c5347968cb8162d7acf42ab40515e516149198c76a5"}, "length": 528},
+      "availability": "checked_in",
+      "relative_path": "fixtures/w1/speech-peer-cancellation-v1.json"
+    }],
+    "state_identities": [],
+    "prerequisites": [],
+    "replay": [{
+      "program": {"kind": "cargo"},
+      "argv": ["test", "--locked", "-p", "speech-native-host", "--test", "w1_vertical", "w1_deterministic_peer_cancellation_projection", "--features", "unstable-w1-vertical-tests", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {"id": "speech.peer.cancellation.expected_projection.v1", "digest": {"algorithm": "sha256", "hex": "6207c3a7978ea4a27ae0430ac949e660bc8f745f58a5bfabc561d03d52d0de5c"}, "length": 1928}
+  }],
+  "omitted_claims": ["Parakeet model inference", "Apple platform synthesis"],
+  "negative_evidence": []
+}

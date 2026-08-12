@@ -1,0 +1,7 @@
+/fixtures/w1/*.json text eol=lf
+/fixtures/w1/manifests/*.json text eol=lf
+/fixtures/w1/projections/*.json text eol=lf
+/fixtures/w1/source/*.json text eol=lf
+/fixtures/w1/MANIFEST.sha256 text eol=lf
+/tests/apple-tauri-w1/Cargo.lock text eol=lf
+/tests/apple-tauri-w1/*.json text eol=lf

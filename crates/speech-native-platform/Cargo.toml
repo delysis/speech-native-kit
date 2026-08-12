@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+unstable-w1-vertical-tests = []
+
 [dependencies]
 async-trait.workspace = true
 speech-native-types = { path = "../speech-native-types" }

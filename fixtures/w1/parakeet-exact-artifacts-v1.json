@@ -1,0 +1,22 @@
+{
+  "schema": "delysis.parakeet_exact_artifacts.v1",
+  "snapshot": "altunenes/parakeet-rs@a61d2818df4659c956b9661a9447f46e98c15126",
+  "model_id": "realtime_eou_120m-v1-onnx",
+  "concatenation_order": ["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"],
+  "files": [
+    {"name": "encoder.onnx", "sha256": "d472887cc38a784a5bfc21c2dbe247639edc3b3f9992388d8ceceaec07256b5b", "byte_len": 459341289},
+    {"name": "decoder_joint.onnx", "sha256": "9d2553ac043c2fc5f69e970769b0fb8ab9103fbfdeb7d26a1ea9729d4bd2dddd", "byte_len": 21347639},
+    {"name": "tokenizer.json", "sha256": "f6b0ad8690559351fa478116fe0985a203b76f7c040f3a9381f485c99c0325f8", "byte_len": 20053}
+  ],
+  "combined_sha256": "c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756",
+  "combined_byte_len": 480708981,
+  "audio": {
+    "generator": "say -v Samantha -r 155, then afconvert -f WAVE -d LEF32@16000 -c 1",
+    "spoken_text": "The river moved quietly beneath the old stone bridge while morning light reached the valley.",
+    "sha256": "326d6723b8bcd7ae63cdff4a2c3e536a29a9d3a44e30f9dca7b65e58a9b4aa34",
+    "byte_len": 305580,
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "sample_format": "f32_le"
+  }
+}
