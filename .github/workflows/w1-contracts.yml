@@ -24,3 +24,7 @@ jobs:
       - run: cargo clippy --locked -p speech-native-host --all-targets --features unstable-w1-contract-tests -- -D warnings
       - run: cargo test --locked -p speech-native-host --all-targets --features unstable-w1-vertical-tests
       - run: cargo clippy --locked -p speech-native-host --all-targets --features unstable-w1-vertical-tests -- -D warnings
+      - name: Test fake-owner quit and relaunch vertical
+        run: cargo test --locked -p speech-native-host --test w1_vertical w1_quit_relaunch_fake_owners_projection --features unstable-w1-contract-tests,unstable-w1-vertical-tests -- --exact
+      - name: Lint combined lifecycle and vertical evidence
+        run: cargo clippy --locked -p speech-native-host --all-targets --features unstable-w1-contract-tests,unstable-w1-vertical-tests -- -D warnings

@@ -1,0 +1,35 @@
+{
+  "schema": "delysis.vertical_fixture_manifest.v0",
+  "vertical_id": "quit_relaunch_fake_owners",
+  "class": "model_free",
+  "contract_revision": "cbab33555ab9355a6ac453d659c55ec9e0666821",
+  "cases": [{
+    "case_id": "speech.quit_relaunch_fake_owners.v1",
+    "source": {
+      "repository_id": "delysis/speech-native-kit",
+      "commit": "368196350803ac0a798fab142cd6cdc64b7e6fb6",
+      "production_tree": {"id": "speech.quit_relaunch.production_tree.3681963", "digest": {"algorithm": "sha256", "hex": "83023ccb827143b1cfe76a8927902248f1d9174728f8c015117dfecedbd3f4c2"}, "length": 375}
+    },
+    "inputs": [{
+      "identity": {"id": "speech.quit_relaunch.input.v1", "digest": {"algorithm": "sha256", "hex": "98870bbca46ecd37a0caf5fdeb2f0ce5c8c92a652b13fb5bfc801f43ef160264"}, "length": 317},
+      "availability": "checked_in",
+      "relative_path": "fixtures/w1/speech-quit-relaunch-v1.json"
+    }],
+    "state_identities": [],
+    "prerequisites": [],
+    "replay": [{
+      "program": {"kind": "cargo"},
+      "argv": ["test", "--locked", "-p", "speech-native-host", "--test", "w1_vertical", "w1_quit_relaunch_fake_owners_projection", "--features", "unstable-w1-contract-tests,unstable-w1-vertical-tests", "--", "--exact"],
+      "required_environment": [],
+      "network": "denied"
+    }],
+    "expected_projection": {"id": "speech.quit_relaunch.expected_projection.v1", "digest": {"algorithm": "sha256", "hex": "cfd2d752a83fe67a44b58157dac43decbd8b52e3b89895a1588d507fff4bca07"}, "length": 2776}
+  }],
+  "omitted_claims": [
+    "operating-system process relaunch",
+    "real model loading or inference",
+    "Apple platform synthesis",
+    "Parakeet model transcription"
+  ],
+  "negative_evidence": []
+}
