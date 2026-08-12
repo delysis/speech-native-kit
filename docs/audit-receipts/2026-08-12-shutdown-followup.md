@@ -21,14 +21,15 @@ and backend shutdown panics become retained errors, and every waiter observes a
 published terminal result. All wait loops pin and enable their notification
 before checking state.
 
-`TaskSupervisor` now retains exact IDs only for a bounded work epoch. Whenever
-a new task is admitted from idle, the previous epoch's strings are cleared;
-concurrent tasks accumulate in the same epoch, and joined IDs are recorded only
-after actual handles are awaited. Process-lifetime work remains represented by
-checked admitted/completed counters. At quiescence, the latest exact epoch is
-frozen for the shutdown contract. Ten-thousand sequential generic tasks assert
-a one-entry bound; one-thousand concurrent Apple and Parakeet workers assert
-storage no larger than that bounded concurrency epoch.
+`TaskSupervisor` now retains every currently active worker ID plus a fixed
+1,024-entry archive of the most recently completed worker IDs. Joined IDs are
+recorded only after actual handles are awaited; evicting an old completed ID
+removes the same ID from expected-worker evidence. Process-lifetime work remains
+represented by checked admitted/completed counters. Snapshot invariants reject
+partial or mismatched ID sets instead of reporting false clean state. Tests
+cover ten-thousand sequential generic tasks, a held task that remains active
+while 10,240 short tasks complete, and one-thousand concurrent Apple and
+Parakeet workers.
 
 Public ID-only cancellation rechecks the captured route generation against the
 current operation lease. A request-ID reuse race returns zero without marking

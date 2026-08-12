@@ -1,10 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, oneshot};
 use tokio::task::JoinHandle;
+
+const COMPLETED_WORKER_ID_CAPACITY: usize = 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TaskSupervisorPhase {
@@ -39,7 +41,12 @@ pub struct TaskSupervisorSnapshot {
     pub total_failures: usize,
     pub admitted_tasks: usize,
     pub completed_tasks: usize,
+    /// Every currently active worker plus the bounded recent-completion
+    /// archive represented by `joined_worker_ids`.
     pub expected_worker_ids: Vec<String>,
+    /// The most recent completed worker IDs, in join order, capped by the
+    /// supervisor's fixed archive capacity. Process-lifetime completion truth
+    /// is carried by `completed_tasks`.
     pub joined_worker_ids: Vec<String>,
 }
 
@@ -61,8 +68,8 @@ struct TaskSupervisorState {
     admitted_tasks: usize,
     completed_tasks: usize,
     next_worker_sequence: u64,
-    expected_worker_ids: BTreeSet<String>,
-    joined_worker_ids: Vec<String>,
+    active_worker_ids: BTreeSet<String>,
+    joined_worker_ids: VecDeque<String>,
     // Each entry is a retained reaper task. The reaper owns and awaits the
     // actual worker JoinHandle, then (and only then) records the worker ID as
     // joined and removes this retained outer handle.
@@ -88,8 +95,8 @@ impl Default for TaskSupervisor {
                 admitted_tasks: 0,
                 completed_tasks: 0,
                 next_worker_sequence: 1,
-                expected_worker_ids: BTreeSet::new(),
-                joined_worker_ids: Vec::new(),
+                active_worker_ids: BTreeSet::new(),
+                joined_worker_ids: VecDeque::new(),
                 join_handles: BTreeMap::new(),
             }),
             faulted: AtomicBool::new(false),
@@ -239,7 +246,25 @@ impl TaskSupervisor {
             .state
             .lock()
             .map_err(|_| TaskSupervisorError::StateUnavailable)?;
-        if state.active == 0 && !state.join_handles.is_empty() {
+        let unique_joined_worker_count = state
+            .joined_worker_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len();
+        let accounted_tasks = state
+            .completed_tasks
+            .checked_add(state.active)
+            .ok_or(TaskSupervisorError::StateUnavailable)?;
+        if (state.active == 0 && !state.join_handles.is_empty())
+            || state.active_worker_ids.len() != state.active
+            || accounted_tasks != state.admitted_tasks
+            || state.joined_worker_ids.len() > COMPLETED_WORKER_ID_CAPACITY
+            || unique_joined_worker_count != state.joined_worker_ids.len()
+            || state
+                .join_handles
+                .iter()
+                .any(|(worker_id, _)| !state.active_worker_ids.contains(worker_id))
+        {
             self.faulted.store(true, Ordering::Release);
             self.idle.notify_waiters();
             return Err(TaskSupervisorError::StateUnavailable);
@@ -248,14 +273,22 @@ impl TaskSupervisor {
         let total_failures = retained_failures
             .checked_add(state.additional_failures)
             .ok_or(TaskSupervisorError::StateUnavailable)?;
+        let mut expected_worker_ids = state.active_worker_ids.clone();
+        for worker_id in &state.joined_worker_ids {
+            if !expected_worker_ids.insert(worker_id.clone()) {
+                self.faulted.store(true, Ordering::Release);
+                self.idle.notify_waiters();
+                return Err(TaskSupervisorError::StateUnavailable);
+            }
+        }
         Ok(TaskSupervisorSnapshot {
             active: state.active,
             retained_failures,
             total_failures,
             admitted_tasks: state.admitted_tasks,
             completed_tasks: state.completed_tasks,
-            expected_worker_ids: state.expected_worker_ids.iter().cloned().collect(),
-            joined_worker_ids: state.joined_worker_ids.clone(),
+            expected_worker_ids: expected_worker_ids.into_iter().collect(),
+            joined_worker_ids: state.joined_worker_ids.iter().cloned().collect(),
         })
     }
 
@@ -282,16 +315,8 @@ impl TaskSupervisor {
         let next_worker_sequence = sequence
             .checked_add(1)
             .ok_or(TaskSupervisorError::StateUnavailable)?;
-        if state.active == 0 {
-            // Begin a new bounded work epoch. Exact identities remain
-            // available for the most recently exercised concurrent epoch,
-            // while completed process-lifetime history is represented only
-            // by the checked admitted/completed counters.
-            state.expected_worker_ids.clear();
-            state.joined_worker_ids.clear();
-        }
         let worker_id = format!("{}:task-{sequence}:{label}", self.scope);
-        if !state.expected_worker_ids.insert(worker_id.clone()) {
+        if !state.active_worker_ids.insert(worker_id.clone()) {
             return Err(TaskSupervisorError::StateUnavailable);
         }
         state.active = active;
@@ -330,7 +355,7 @@ impl TaskSupervisor {
             return;
         };
         if state.active == 0
-            || !state.expected_worker_ids.contains(&worker_id)
+            || !state.active_worker_ids.contains(&worker_id)
             || state.joined_worker_ids.contains(&worker_id)
             || !state.join_handles.contains_key(&worker_id)
         {
@@ -352,8 +377,25 @@ impl TaskSupervisor {
         }
         state.active -= 1;
         state.completed_tasks = completed_tasks;
-        state.joined_worker_ids.push(worker_id.clone());
+        if !state.active_worker_ids.remove(&worker_id) {
+            self.faulted.store(true, Ordering::Release);
+            self.idle.notify_waiters();
+            return;
+        }
+        state.joined_worker_ids.push_back(worker_id.clone());
         state.join_handles.remove(&worker_id);
+        if state.joined_worker_ids.len() > COMPLETED_WORKER_ID_CAPACITY {
+            let Some(evicted) = state.joined_worker_ids.pop_front() else {
+                self.faulted.store(true, Ordering::Release);
+                self.idle.notify_waiters();
+                return;
+            };
+            if evicted == worker_id {
+                self.faulted.store(true, Ordering::Release);
+                self.idle.notify_waiters();
+                return;
+            }
+        }
         if state.active == 0 {
             self.idle.notify_waiters();
         }
@@ -452,7 +494,13 @@ mod tests {
         let snapshot = supervisor.snapshot().expect("read completed task state");
         assert_eq!(snapshot.admitted_tasks, 1);
         assert_eq!(snapshot.completed_tasks, 1);
-        assert_eq!(snapshot.joined_worker_ids, snapshot.expected_worker_ids);
+        assert_eq!(
+            snapshot
+                .joined_worker_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            snapshot.expected_worker_ids.into_iter().collect()
+        );
         assert!(
             supervisor
                 .state
@@ -464,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_running_history_is_bounded_before_shutdown_epoch() {
+    async fn completed_running_history_uses_a_bounded_recent_archive() {
         let supervisor = Arc::new(TaskSupervisor::with_scope("bounded-history"));
         for sequence in 0..10_000 {
             supervisor
@@ -477,8 +525,17 @@ mod tests {
         assert_eq!(snapshot.active, 0);
         assert_eq!(snapshot.admitted_tasks, 10_000);
         assert_eq!(snapshot.completed_tasks, 10_000);
-        assert_eq!(snapshot.expected_worker_ids.len(), 1);
-        assert_eq!(snapshot.joined_worker_ids, snapshot.expected_worker_ids);
+        assert_eq!(
+            snapshot.expected_worker_ids.len(),
+            COMPLETED_WORKER_ID_CAPACITY
+        );
+        assert_eq!(
+            snapshot
+                .joined_worker_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            snapshot.expected_worker_ids.into_iter().collect()
+        );
         assert!(
             supervisor
                 .state
@@ -486,6 +543,71 @@ mod tests {
                 .expect("bounded supervisor state")
                 .join_handles
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn held_task_does_not_prevent_completed_id_eviction() {
+        let supervisor = Arc::new(TaskSupervisor::with_scope("held-bounded-history"));
+        let (release_held, held_released) = oneshot::channel();
+        supervisor
+            .spawn("held", async move {
+                held_released.await.map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .expect("spawn held task");
+        let held_worker_id = supervisor
+            .snapshot()
+            .expect("held task snapshot")
+            .expected_worker_ids
+            .into_iter()
+            .find(|worker_id| worker_id.ends_with(":held"))
+            .expect("held worker ID is exact");
+
+        let short_task_count = 10_240usize;
+        for sequence in 0..short_task_count {
+            let (finished, observe_finished) = oneshot::channel();
+            supervisor
+                .spawn(format!("short-{sequence}"), async move {
+                    let _observer_gone = finished.send(()).is_err();
+                    Ok(())
+                })
+                .expect("spawn short task");
+            observe_finished.await.expect("short task body completes");
+            loop {
+                let snapshot = supervisor.snapshot().expect("bounded active snapshot");
+                if snapshot.completed_tasks == sequence + 1 {
+                    assert_eq!(snapshot.active, 1);
+                    assert!(snapshot.expected_worker_ids.contains(&held_worker_id));
+                    assert!(
+                        snapshot.expected_worker_ids.len()
+                            <= COMPLETED_WORKER_ID_CAPACITY + snapshot.active
+                    );
+                    assert!(snapshot.joined_worker_ids.len() <= COMPLETED_WORKER_ID_CAPACITY);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        release_held.send(()).expect("release held task");
+        supervisor.wait_for_idle().await.expect("join held task");
+        let snapshot = supervisor.snapshot().expect("bounded idle snapshot");
+        assert_eq!(snapshot.active, 0);
+        assert_eq!(snapshot.admitted_tasks, short_task_count + 1);
+        assert_eq!(snapshot.completed_tasks, short_task_count + 1);
+        assert!(snapshot.expected_worker_ids.contains(&held_worker_id));
+        assert_eq!(
+            snapshot.expected_worker_ids.len(),
+            COMPLETED_WORKER_ID_CAPACITY
+        );
+        assert_eq!(
+            snapshot
+                .joined_worker_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            snapshot.expected_worker_ids.into_iter().collect()
         );
     }
 
