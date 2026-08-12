@@ -20,6 +20,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc, oneshot};
 
+#[cfg(feature = "unstable-w1-contract-tests")]
+mod w1_contracts;
+#[cfg(feature = "unstable-w1-contract-tests")]
+pub use w1_contracts::SpeechW1ContractAdapter;
+
 const REGISTERED_SOURCE_ID: &str = "registered-speech-backends";
 
 #[derive(Debug, thiserror::Error, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +95,23 @@ struct HostState {
     backends: BTreeMap<String, Arc<dyn SpeechBackend>>,
     active: BTreeMap<SpeechRequestId, Arc<ActiveSpeechOperation>>,
     shutdown_result: Option<Result<(), SpeechHostError>>,
+    #[cfg(feature = "unstable-w1-contract-tests")]
+    shutdown_facts: Option<HostShutdownFacts>,
+}
+
+#[cfg(feature = "unstable-w1-contract-tests")]
+#[derive(Clone)]
+struct HostShutdownFacts {
+    backends: Vec<BackendShutdownFact>,
+    tasks: speech_native_types::TaskSupervisorSnapshot,
+    monitor_failure: Option<speech_native_types::SupervisedTaskFailureSummary>,
+}
+
+#[cfg(feature = "unstable-w1-contract-tests")]
+#[derive(Clone)]
+struct BackendShutdownFact {
+    backend_id: String,
+    error: Option<SpeechError>,
 }
 
 struct HostLifecycle {
@@ -144,6 +166,8 @@ impl SpeechHost {
                     backends: BTreeMap::new(),
                     active: BTreeMap::new(),
                     shutdown_result: None,
+                    #[cfg(feature = "unstable-w1-contract-tests")]
+                    shutdown_facts: None,
                 }),
                 changed: Notify::new(),
                 tasks: Arc::new(TaskSupervisor::default()),
@@ -372,10 +396,15 @@ impl SpeechHost {
             operation.backend.cancel(&request_id);
         }
         let mut failures = Vec::new();
+        #[cfg(feature = "unstable-w1-contract-tests")]
+        let mut backend_facts = Vec::with_capacity(backends.len());
         for backend in backends {
-            if let Err(error) = backend.shutdown().await {
-                failures.push(error);
-            }
+            #[cfg(feature = "unstable-w1-contract-tests")]
+            let backend_id = backend.descriptor().id;
+            let error = backend.shutdown().await.err();
+            failures.extend(error.clone());
+            #[cfg(feature = "unstable-w1-contract-tests")]
+            backend_facts.push(BackendShutdownFact { backend_id, error });
         }
         self.wait_for_active_empty().await?;
         self.lifecycle
@@ -383,14 +412,14 @@ impl SpeechHost {
             .wait_for_idle()
             .await
             .map_err(map_task_supervisor_error)?;
-        if let Some(summary) = self
+        let monitor_failure = self
             .lifecycle
             .tasks
             .failure_summary()
-            .map_err(map_task_supervisor_error)?
-        {
+            .map_err(map_task_supervisor_error)?;
+        if let Some(summary) = &monitor_failure {
             let additional = summary.additional_failures;
-            let first = summary.first;
+            let first = &summary.first;
             failures.push(SpeechError::unavailable(
                 &SpeechRequestId("speech-host-monitor".to_string()),
                 "speech_host_monitor_failed",
@@ -405,6 +434,12 @@ impl SpeechHost {
         } else {
             Err(SpeechHostError::Shutdown { failures })
         };
+        #[cfg(feature = "unstable-w1-contract-tests")]
+        let task_snapshot = self
+            .lifecycle
+            .tasks
+            .snapshot()
+            .map_err(map_task_supervisor_error)?;
         {
             let mut state = self
                 .lifecycle
@@ -412,6 +447,14 @@ impl SpeechHost {
                 .lock()
                 .map_err(|_| SpeechHostError::StateUnavailable)?;
             state.shutdown_result = Some(result.clone());
+            #[cfg(feature = "unstable-w1-contract-tests")]
+            {
+                state.shutdown_facts = Some(HostShutdownFacts {
+                    backends: backend_facts,
+                    tasks: task_snapshot,
+                    monitor_failure,
+                });
+            }
             state.phase = HostPhase::Closed;
         }
         self.lifecycle.changed.notify_waiters();
@@ -1172,6 +1215,65 @@ mod tests {
             host.synthesize(exact_request("late", "deferred.tts")).await,
             Err(SpeechHostError::AdmissionClosed)
         ));
+    }
+
+    #[cfg(feature = "unstable-w1-contract-tests")]
+    #[test]
+    fn w1_capability_envelope_projects_real_registered_descriptors() {
+        let host = SpeechHost::default();
+        host.register_backend(fixture_backend("fixture.tts"))
+            .expect("register real host descriptor");
+
+        let snapshot = host
+            .w1_contract_adapter()
+            .capability_snapshot()
+            .expect("project canonical capability snapshot");
+        platform_contract_testkit::validate_capability_snapshot_v0(&snapshot)
+            .expect("canonical capability snapshot validates");
+        let speech = snapshot.services.values().next().expect("speech service");
+        assert!(
+            speech
+                .iter()
+                .any(|entry| entry.backend_or_resource_id == "fixture.tts.synthesis")
+        );
+    }
+
+    #[cfg(feature = "unstable-w1-contract-tests")]
+    #[tokio::test]
+    async fn w1_closed_summary_uses_real_registry_task_and_backend_shutdown_facts() {
+        let host = SpeechHost::default();
+        let healthy = fixture_backend("healthy.tts");
+        let first_failure = failing_fixture_backend("failure-a.tts");
+        let second_failure = failing_fixture_backend("failure-b.tts");
+        for backend in [&healthy, &first_failure, &second_failure] {
+            host.register_backend(backend.clone())
+                .expect("register shutdown backend");
+        }
+
+        assert!(host.shutdown().await.is_err());
+        let summary = host
+            .w1_contract_adapter()
+            .closed_summary()
+            .expect("project retained real shutdown facts");
+        summary
+            .validate()
+            .expect("canonical closed summary validates");
+        assert_eq!(summary.active_operations, 0);
+        assert_eq!(summary.retained_tasks, 0);
+        assert_eq!(summary.failures.len(), 2);
+        assert_eq!(
+            summary
+                .resources
+                .iter()
+                .filter(|resource| {
+                    resource.kind == platform_contracts_v0::ShutdownResourceKind::Backend
+                })
+                .count(),
+            3
+        );
+        assert_eq!(healthy.shutdown_calls.load(Ordering::Acquire), 1);
+        assert_eq!(first_failure.shutdown_calls.load(Ordering::Acquire), 1);
+        assert_eq!(second_failure.shutdown_calls.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]

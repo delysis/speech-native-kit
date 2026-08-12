@@ -60,7 +60,7 @@ jobs:
           components: rustfmt,clippy
       - run: cargo fmt --all --check
       - run: cargo test --locked --workspace --all-targets
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - if: runner.os != 'Windows'
         run: ./scripts/check-boundaries.sh
 

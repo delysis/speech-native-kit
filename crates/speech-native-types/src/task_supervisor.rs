@@ -35,6 +35,8 @@ pub struct TaskSupervisorSnapshot {
     pub active: usize,
     pub retained_failures: usize,
     pub total_failures: usize,
+    pub admitted_tasks: usize,
+    pub completed_tasks: usize,
 }
 
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +54,8 @@ struct TaskSupervisorState {
     active: usize,
     first_failure: Option<SupervisedTaskFailure>,
     additional_failures: usize,
+    admitted_tasks: usize,
+    completed_tasks: usize,
 }
 
 pub struct TaskSupervisor {
@@ -67,6 +71,8 @@ impl Default for TaskSupervisor {
                 active: 0,
                 first_failure: None,
                 additional_failures: 0,
+                admitted_tasks: 0,
+                completed_tasks: 0,
             }),
             idle: Notify::new(),
         }
@@ -184,6 +190,8 @@ impl TaskSupervisor {
             active: state.active,
             retained_failures,
             total_failures: retained_failures.saturating_add(state.additional_failures),
+            admitted_tasks: state.admitted_tasks,
+            completed_tasks: state.completed_tasks,
         })
     }
 
@@ -195,10 +203,16 @@ impl TaskSupervisor {
         if state.phase != TaskSupervisorPhase::Running {
             return Err(TaskSupervisorError::AdmissionClosed);
         }
-        state.active = state
+        let active = state
             .active
             .checked_add(1)
             .ok_or(TaskSupervisorError::StateUnavailable)?;
+        let admitted_tasks = state
+            .admitted_tasks
+            .checked_add(1)
+            .ok_or(TaskSupervisorError::StateUnavailable)?;
+        state.active = active;
+        state.admitted_tasks = admitted_tasks;
         Ok(())
     }
 
@@ -215,6 +229,7 @@ impl TaskSupervisor {
             }
         }
         state.active = state.active.saturating_sub(1);
+        state.completed_tasks = state.completed_tasks.saturating_add(1);
         if state.active == 0 {
             self.idle.notify_waiters();
         }
@@ -269,6 +284,8 @@ mod tests {
         assert_eq!(snapshot.active, 0);
         assert_eq!(snapshot.retained_failures, 1);
         assert_eq!(snapshot.total_failures, 2);
+        assert_eq!(snapshot.admitted_tasks, 2);
+        assert_eq!(snapshot.completed_tasks, 2);
     }
 
     #[tokio::test]
@@ -306,5 +323,8 @@ mod tests {
         release.send(()).expect("release held task");
         supervisor.wait_for_idle().await.expect("wait for idle");
         assert_eq!(supervisor.snapshot().expect("read task state").active, 0);
+        let snapshot = supervisor.snapshot().expect("read completed task state");
+        assert_eq!(snapshot.admitted_tasks, 1);
+        assert_eq!(snapshot.completed_tasks, 1);
     }
 }

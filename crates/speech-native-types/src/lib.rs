@@ -1398,7 +1398,7 @@ fn validate_pcm_bytes(
     request_id: &SpeechRequestId,
 ) -> Result<(), SpeechError> {
     validate_audio_bytes(data, request_id)?;
-    if data.len() % format.bytes_per_frame() != 0 {
+    if !data.len().is_multiple_of(format.bytes_per_frame()) {
         return Err(SpeechError::invalid_request(
             request_id,
             "pcm_frame_incomplete",
