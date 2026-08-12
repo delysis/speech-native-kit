@@ -18,15 +18,14 @@ use speech_native_types::{
     PlatformTarget, SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind,
     SpeechBackendReadiness, SpeechCancellation, SpeechError, SpeechErrorClass, SpeechRequestId,
     SpeechResolvedRoute, SpeechRouteSelector, SpeechUsage, SynthesisEvent, SynthesisInput,
-    SynthesisRequest, SynthesisResponse, SynthesisTicket, TranscriptionRequest,
-    TranscriptionTicket, UsageProvenance, VoiceSelector,
+    SynthesisRequest, SynthesisResponse, SynthesisTicket, TaskSupervisor, TaskSupervisorError,
+    TranscriptionRequest, TranscriptionTicket, UsageProvenance, VoiceSelector,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::task::JoinSet;
 
 const APPLE_TTS_BACKEND_ID: &str = "apple.av-speech";
 
@@ -38,7 +37,7 @@ pub struct AppleSpeechBackend {
 
 struct AppleBackendState {
     data: Mutex<AppleBackendStateData>,
-    workers: Mutex<JoinSet<()>>,
+    tasks: Arc<TaskSupervisor>,
     changed: Notify,
 }
 
@@ -80,9 +79,64 @@ impl Default for AppleBackendState {
                 active: HashMap::new(),
                 shutdown_result: None,
             }),
-            workers: Mutex::new(JoinSet::new()),
+            tasks: Arc::new(TaskSupervisor::default()),
             changed: Notify::new(),
         }
+    }
+}
+
+impl AppleBackendState {
+    fn spawn_operation(
+        self: &Arc<Self>,
+        request_id: SpeechRequestId,
+        cancelled: Arc<AtomicBool>,
+        worker: impl FnOnce() + Send + 'static,
+    ) -> Result<(), SpeechError> {
+        let mut data = self.data.lock().map_err(|_| apple_state_error())?;
+        if data.phase != AppleBackendPhase::Running {
+            return Err(backend_error(
+                &request_id,
+                "apple_tts_shutting_down",
+                SpeechErrorClass::Unavailable,
+                true,
+                "Apple speech synthesis is shutting down",
+            ));
+        }
+        if data.active.contains_key(&request_id) {
+            return Err(backend_error(
+                &request_id,
+                "speech_request_duplicate",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "A speech request with this request_id is already active",
+            ));
+        }
+        let nonce = data.next_nonce;
+        data.next_nonce = data.next_nonce.checked_add(1).ok_or_else(|| {
+            backend_error(
+                &request_id,
+                "apple_tts_nonce_exhausted",
+                SpeechErrorClass::Internal,
+                false,
+                "Apple speech request nonce space is exhausted",
+            )
+        })?;
+        let state = Arc::clone(self);
+        let worker_request_id = request_id.clone();
+        self.tasks
+            .spawn_blocking(format!("apple-tts:{}", request_id.0), move || {
+                let _lease = AppleOperationLease {
+                    state,
+                    request_id: worker_request_id,
+                    nonce,
+                };
+                worker();
+                Ok(())
+            })
+            .map_err(|error| task_supervisor_error(&request_id, error))?;
+        data.active
+            .insert(request_id, ActiveAppleOperation { cancelled, nonce });
+        Ok(())
     }
 }
 
@@ -145,38 +199,9 @@ impl SpeechBackend for AppleSpeechBackend {
         let (event_sender, event_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_sender, final_receiver) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        {
-            let mut data = self.state.data.lock().map_err(|_| apple_state_error())?;
-            if data.phase != AppleBackendPhase::Running {
-                return Err(backend_error(
-                    &request_id,
-                    "apple_tts_shutting_down",
-                    SpeechErrorClass::Unavailable,
-                    true,
-                    "Apple speech synthesis is shutting down",
-                ));
-            }
-            if data.active.contains_key(&request_id) {
-                return Err(backend_error(
-                    &request_id,
-                    "speech_request_duplicate",
-                    SpeechErrorClass::InvalidRequest,
-                    false,
-                    "A speech request with this request_id is already active",
-                ));
-            }
-            let nonce = data.next_nonce;
-            data.next_nonce = data.next_nonce.wrapping_add(1);
-            let mut workers = self.state.workers.lock().map_err(|_| apple_state_error())?;
-            let state = Arc::clone(&self.state);
-            let worker_request_id = request_id.clone();
-            let worker_cancelled = Arc::clone(&cancelled);
-            workers.spawn_blocking(move || {
-                let _lease = AppleOperationLease {
-                    state,
-                    request_id: worker_request_id,
-                    nonce,
-                };
+        let worker_cancelled = Arc::clone(&cancelled);
+        self.state
+            .spawn_operation(request_id.clone(), Arc::clone(&cancelled), move || {
                 run_synthesis(
                     request,
                     voice,
@@ -185,15 +210,7 @@ impl SpeechBackend for AppleSpeechBackend {
                     &event_sender,
                     final_sender,
                 );
-            });
-            data.active.insert(
-                request_id.clone(),
-                ActiveAppleOperation {
-                    cancelled: Arc::clone(&cancelled),
-                    nonce,
-                },
-            );
-        }
+            })?;
 
         Ok(SynthesisTicket::new(
             request_id,
@@ -232,28 +249,33 @@ impl SpeechBackend for AppleSpeechBackend {
         if !leader {
             return wait_for_apple_shutdown(&self.state).await;
         }
-        let mut workers = {
-            let mut workers = self.state.workers.lock().map_err(|_| apple_state_error())?;
-            std::mem::replace(&mut *workers, JoinSet::new())
-        };
-        let mut failure = None;
-        while let Some(result) = workers.join_next().await {
-            if let Err(error) = result {
-                failure.get_or_insert_with(|| {
-                    backend_error(
-                        &SpeechRequestId("apple-shutdown".to_string()),
-                        "apple_tts_worker_failed",
-                        SpeechErrorClass::Internal,
-                        false,
-                        &format!("An Apple speech worker failed during shutdown: {error}"),
-                    )
-                });
-            }
-        }
-        let result = failure.map_or(Ok(()), Err);
+        self.state.tasks.begin_shutdown().map_err(|error| {
+            task_supervisor_error(&SpeechRequestId("apple-shutdown".to_string()), error)
+        })?;
+        self.state.tasks.wait_for_idle().await.map_err(|error| {
+            task_supervisor_error(&SpeechRequestId("apple-shutdown".to_string()), error)
+        })?;
+        let result = self
+            .state
+            .tasks
+            .failure_summary()
+            .map_err(|error| task_supervisor_error(&SpeechRequestId("apple-shutdown".to_string()), error))?
+            .map_or(Ok(()), |summary| {
+                let additional = summary.additional_failures;
+                let first = summary.first;
+                Err(backend_error(
+                    &SpeechRequestId("apple-shutdown".to_string()),
+                    "apple_tts_worker_failed",
+                    SpeechErrorClass::Internal,
+                    false,
+                    &format!(
+                        "Apple speech worker '{}' failed ({:?}): {}; {additional} additional failure(s)",
+                        first.label, first.kind, first.detail
+                    ),
+                ))
+            });
         {
             let mut data = self.state.data.lock().map_err(|_| apple_state_error())?;
-            data.active.clear();
             data.shutdown_result = Some(result.clone());
             data.phase = AppleBackendPhase::Closed;
         }
@@ -313,6 +335,16 @@ fn apple_state_error() -> SpeechError {
         SpeechErrorClass::Internal,
         true,
         "Apple speech synthesis request state is unavailable",
+    )
+}
+
+fn task_supervisor_error(request_id: &SpeechRequestId, error: TaskSupervisorError) -> SpeechError {
+    backend_error(
+        request_id,
+        "apple_tts_worker_state_unavailable",
+        SpeechErrorClass::Internal,
+        true,
+        &format!("Apple speech worker supervision failed: {error}"),
     )
 }
 
@@ -963,5 +995,146 @@ mod tests {
         assert_eq!(&wav[..4], b"RIFF");
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(crate::apple::APPLE_RUNTIME_SOURCE_ID, "apple-runtime");
+    }
+
+    #[tokio::test]
+    async fn completed_apple_workers_self_reap_task_state() {
+        let state = Arc::new(AppleBackendState::default());
+        for index in 0..1_000 {
+            state
+                .spawn_operation(
+                    SpeechRequestId(format!("self-reaping-apple-worker-{index}")),
+                    Arc::new(AtomicBool::new(false)),
+                    || {},
+                )
+                .expect("spawn fixture worker");
+        }
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("wait for fixture workers");
+
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+        let task_state = state.tasks.snapshot().expect("read task state");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_joins_the_owned_apple_worker() {
+        let backend = AppleSpeechBackend::discover()
+            .await
+            .expect("discover Apple TTS");
+        let request_id = SpeechRequestId("blocking-apple-worker".to_string());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        backend
+            .state
+            .spawn_operation(request_id, Arc::clone(&cancelled), move || {
+                started_sender.send(()).expect("signal worker start");
+                release_receiver.recv().expect("release Apple worker");
+            })
+            .expect("spawn blocking Apple fixture worker");
+        started_receiver.recv().expect("Apple worker must start");
+
+        let shutdown_backend = backend.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        release_sender.send(()).expect("release Apple worker");
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("Apple backend shutdown succeeds");
+        backend
+            .shutdown()
+            .await
+            .expect("repeated shutdown retains success");
+
+        let data = backend.state.data.lock().expect("lock closed state");
+        assert_eq!(data.phase, AppleBackendPhase::Closed);
+        assert!(data.active.is_empty());
+        drop(data);
+        let task_state = backend.state.tasks.snapshot().expect("read task state");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn apple_domain_error_self_reaps_without_task_failure() {
+        let state = Arc::new(AppleBackendState::default());
+        let request_id = SpeechRequestId("apple-domain-error".to_string());
+        let worker_request_id = request_id.clone();
+        let (result_sender, result_receiver) = std::sync::mpsc::channel();
+        state
+            .spawn_operation(request_id, Arc::new(AtomicBool::new(false)), move || {
+                let result = encode_wav(&worker_request_id, &[]);
+                result_sender.send(result).expect("send domain result");
+            })
+            .expect("spawn domain-error fixture worker");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("wait for domain-error worker");
+
+        let error = result_receiver
+            .recv()
+            .expect("receive domain result")
+            .expect_err("empty Apple buffers must produce a domain error");
+        assert_eq!(error.code, "apple_tts_audio_empty");
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+        let task_state = state.tasks.snapshot().expect("read task state");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn apple_worker_panic_is_preserved_before_reaping() {
+        let state = Arc::new(AppleBackendState::default());
+        state
+            .spawn_operation(
+                SpeechRequestId("panicking-apple-worker".to_string()),
+                Arc::new(AtomicBool::new(false)),
+                || panic!("fixture Apple panic"),
+            )
+            .expect("spawn panic fixture");
+        state.tasks.wait_for_idle().await.expect("wait for panic");
+
+        let failure = state
+            .tasks
+            .failure_summary()
+            .expect("read failure summary")
+            .expect("panic is retained")
+            .first;
+        assert_eq!(
+            failure.kind,
+            speech_native_types::SupervisedTaskFailureKind::Panic
+        );
+        assert!(failure.detail.contains("fixture Apple panic"));
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apple_nonce_exhaustion_fails_closed() {
+        let state = Arc::new(AppleBackendState::default());
+        state.data.lock().expect("lock state").next_nonce = u64::MAX;
+        let error = state
+            .spawn_operation(
+                SpeechRequestId("nonce-exhausted".to_string()),
+                Arc::new(AtomicBool::new(false)),
+                || {},
+            )
+            .expect_err("nonce exhaustion must reject admission");
+
+        assert_eq!(error.code, "apple_tts_nonce_exhausted");
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+        assert_eq!(state.tasks.snapshot().expect("read task state").active, 0);
     }
 }

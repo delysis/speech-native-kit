@@ -16,10 +16,10 @@ use speech_native_types::{
     SpeechBackend, SpeechBackendDescriptor, SpeechBackendKind, SpeechBackendReadiness,
     SpeechCancellation, SpeechCapability, SpeechCapabilityLimits, SpeechError, SpeechErrorClass,
     SpeechModelDescriptor, SpeechOperationCapability, SpeechRequestId, SpeechResolvedRoute,
-    SpeechRouteSelector, SpeechUsage, SynthesisRequest, SynthesisTicket, TimestampGranularity,
-    TranscriptSegment, TranscriptionAudioSink, TranscriptionCapabilities, TranscriptionEvent,
-    TranscriptionInput, TranscriptionRequest, TranscriptionResponse, TranscriptionTask,
-    TranscriptionTicket, UsageProvenance,
+    SpeechRouteSelector, SpeechUsage, SynthesisRequest, SynthesisTicket, TaskSupervisor,
+    TaskSupervisorError, TimestampGranularity, TranscriptSegment, TranscriptionAudioSink,
+    TranscriptionCapabilities, TranscriptionEvent, TranscriptionInput, TranscriptionRequest,
+    TranscriptionResponse, TranscriptionTask, TranscriptionTicket, UsageProvenance,
 };
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::task::JoinSet;
 
 pub const PARAKEET_BACKEND_ID: &str = "parakeet-rs.eou-120m";
 pub const PARAKEET_MODEL_ID: &str = "parakeet-realtime-eou-120m-v1-onnx";
@@ -54,7 +53,7 @@ pub struct ParakeetSpeechBackend {
 
 struct BackendState {
     data: Mutex<BackendStateData>,
-    workers: Mutex<JoinSet<()>>,
+    tasks: Arc<TaskSupervisor>,
     changed: Notify,
 }
 
@@ -108,7 +107,7 @@ impl Default for BackendState {
                 active: HashMap::new(),
                 shutdown_result: None,
             }),
-            workers: Mutex::new(JoinSet::new()),
+            tasks: Arc::new(TaskSupervisor::default()),
             changed: Notify::new(),
         }
     }
@@ -142,26 +141,28 @@ impl BackendState {
             ));
         }
         let nonce = data.next_nonce;
-        data.next_nonce = data.next_nonce.wrapping_add(1);
-        let mut workers = self.workers.lock().map_err(|_| {
+        data.next_nonce = data.next_nonce.checked_add(1).ok_or_else(|| {
             backend_error(
                 &request_id,
-                "parakeet_worker_state_unavailable",
+                "parakeet_nonce_exhausted",
                 SpeechErrorClass::Internal,
-                true,
-                "Parakeet worker state is unavailable",
+                false,
+                "Parakeet request nonce space is exhausted",
             )
         })?;
         let state = Arc::clone(self);
         let worker_request_id = request_id.clone();
-        workers.spawn_blocking(move || {
-            let _lease = BackendOperationLease {
-                state,
-                request_id: worker_request_id,
-                nonce,
-            };
-            worker();
-        });
+        self.tasks
+            .spawn_blocking(format!("parakeet:{}", request_id.0), move || {
+                let _lease = BackendOperationLease {
+                    state,
+                    request_id: worker_request_id,
+                    nonce,
+                };
+                worker();
+                Ok(())
+            })
+            .map_err(|error| task_supervisor_error(&request_id, error))?;
         data.active.insert(
             request_id,
             ActiveParakeetOperation {
@@ -328,28 +329,33 @@ impl SpeechBackend for ParakeetSpeechBackend {
             return wait_for_backend_shutdown(&self.state).await;
         }
 
-        let mut workers = {
-            let mut workers = self.state.workers.lock().map_err(|_| state_error())?;
-            std::mem::replace(&mut *workers, JoinSet::new())
-        };
-        let mut failure = None;
-        while let Some(result) = workers.join_next().await {
-            if let Err(error) = result {
-                failure.get_or_insert_with(|| {
-                    backend_error(
-                        &SpeechRequestId("parakeet-shutdown".to_string()),
-                        "parakeet_worker_failed",
-                        SpeechErrorClass::Internal,
-                        false,
-                        &format!("A Parakeet worker failed during shutdown: {error}"),
-                    )
-                });
-            }
-        }
-        let result = failure.map_or(Ok(()), Err);
+        self.state.tasks.begin_shutdown().map_err(|error| {
+            task_supervisor_error(&SpeechRequestId("parakeet-shutdown".to_string()), error)
+        })?;
+        self.state.tasks.wait_for_idle().await.map_err(|error| {
+            task_supervisor_error(&SpeechRequestId("parakeet-shutdown".to_string()), error)
+        })?;
+        let result = self
+            .state
+            .tasks
+            .failure_summary()
+            .map_err(|error| task_supervisor_error(&SpeechRequestId("parakeet-shutdown".to_string()), error))?
+            .map_or(Ok(()), |summary| {
+                let additional = summary.additional_failures;
+                let first = summary.first;
+                Err(backend_error(
+                    &SpeechRequestId("parakeet-shutdown".to_string()),
+                    "parakeet_worker_failed",
+                    SpeechErrorClass::Internal,
+                    false,
+                    &format!(
+                        "Parakeet worker '{}' failed ({:?}): {}; {additional} additional failure(s)",
+                        first.label, first.kind, first.detail
+                    ),
+                ))
+            });
         {
             let mut data = self.state.data.lock().map_err(|_| state_error())?;
-            data.active.clear();
             data.shutdown_result = Some(result.clone());
             data.phase = BackendPhase::Closed;
         }
@@ -471,6 +477,16 @@ fn state_error() -> SpeechError {
         SpeechErrorClass::Internal,
         true,
         "Parakeet request state is unavailable",
+    )
+}
+
+fn task_supervisor_error(request_id: &SpeechRequestId, error: TaskSupervisorError) -> SpeechError {
+    backend_error(
+        request_id,
+        "parakeet_worker_state_unavailable",
+        SpeechErrorClass::Internal,
+        true,
+        &format!("Parakeet worker supervision failed: {error}"),
     )
 }
 
@@ -1526,5 +1542,78 @@ mod tests {
             .await
             .expect_err("cancelled stream must reject input");
         assert_eq!(error.code, "audio_stream_finished");
+    }
+
+    #[tokio::test]
+    async fn completed_blocking_workers_self_reap_task_state() {
+        let state = Arc::new(BackendState::default());
+        for index in 0..1_000 {
+            state
+                .spawn_operation(
+                    SpeechRequestId(format!("self-reaping-worker-{index}")),
+                    Arc::new(AtomicBool::new(false)),
+                    None,
+                    || {},
+                )
+                .expect("spawn fixture worker");
+        }
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("wait for fixture workers");
+
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+        let task_state = state.tasks.snapshot().expect("read task state");
+        assert_eq!(task_state.active, 0);
+        assert_eq!(task_state.retained_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_panic_is_preserved_by_shutdown() {
+        let backend = ParakeetSpeechBackend::unavailable(asset_required_descriptor());
+        backend
+            .state
+            .spawn_operation(
+                SpeechRequestId("panicking-worker".to_string()),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                || panic!("fixture Parakeet panic"),
+            )
+            .expect("spawn panic fixture");
+
+        let error = backend
+            .shutdown()
+            .await
+            .expect_err("worker panic must fail shutdown");
+        assert_eq!(error.code, "parakeet_worker_failed");
+        assert!(error.safe_detail.contains("fixture Parakeet panic"));
+        assert!(
+            backend
+                .state
+                .data
+                .lock()
+                .expect("lock state")
+                .active
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn parakeet_nonce_exhaustion_fails_closed() {
+        let state = Arc::new(BackendState::default());
+        state.data.lock().expect("lock state").next_nonce = u64::MAX;
+        let error = state
+            .spawn_operation(
+                SpeechRequestId("nonce-exhausted".to_string()),
+                Arc::new(AtomicBool::new(false)),
+                None,
+                || {},
+            )
+            .expect_err("nonce exhaustion must reject admission");
+
+        assert_eq!(error.code, "parakeet_nonce_exhausted");
+        assert!(state.data.lock().expect("lock state").active.is_empty());
+        assert_eq!(state.tasks.snapshot().expect("read task state").active, 0);
     }
 }

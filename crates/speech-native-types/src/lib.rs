@@ -12,6 +12,13 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+mod task_supervisor;
+
+pub use task_supervisor::{
+    SupervisedTaskFailure, SupervisedTaskFailureKind, SupervisedTaskFailureSummary, TaskSupervisor,
+    TaskSupervisorError, TaskSupervisorSnapshot,
+};
+
 pub const SPEECH_CAPABILITY_SCHEMA: &str = "fte.speech.capabilities.v1";
 pub const DEFAULT_SPEECH_EVENT_CAPACITY: usize = 64;
 

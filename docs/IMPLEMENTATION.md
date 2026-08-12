@@ -65,10 +65,14 @@ backend traits without Tauri.
 The host lifecycle is one-way: `running -> quiescing -> closed`. Route
 selection and global request-ID reservation occur under the same state lock.
 The shutdown leader closes admission, cancels every exact active route, asks
-every backend to stop, waits for all backend finals, joins every relay monitor,
-and retains the aggregate result for concurrent and repeated callers. The
-Parakeet and Apple adapters likewise retain every `spawn_blocking` join handle;
-neither adapter can report shutdown while its native worker remains alive.
+every backend to stop, waits for all backend finals, and waits for supervised
+relay activity to reach zero. Relay and blocking-worker task records self-reap
+at completion; retained task state is one failure record plus an aggregate
+failure count, rather than one join record per historical request. Async and
+blocking panics are converted into shutdown evidence. The Parakeet and Apple
+adapters use the same active-count contract, so neither adapter can report
+shutdown while its native worker remains alive. Host and backend request nonces
+use checked allocation and fail closed before wraparound.
 The Tauri plugin performs this joined shutdown at `RunEvent::Exit`, reports a
 failure rather than discarding it, and repeats the retained operation as a
 drop-time fallback.
