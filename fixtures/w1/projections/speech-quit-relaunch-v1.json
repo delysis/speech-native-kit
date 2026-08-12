@@ -1,0 +1,50 @@
+{
+  "ordered_events": [
+    {"sequence": 0, "operation_id": "speech-quit-operation", "attempt_id": "attempt-1", "correlation_id": "speech-quit-relaunch", "kind": "cancelled", "payload": null},
+    {"sequence": 1, "operation_id": "speech-quit-operation", "attempt_id": "attempt-1", "correlation_id": "speech-quit-relaunch", "kind": "owner_joined", "payload": null},
+    {"sequence": 2, "operation_id": "speech-relaunch-operation", "attempt_id": "attempt-1", "correlation_id": "speech-quit-relaunch", "kind": "completed", "payload": null},
+    {"sequence": 3, "operation_id": "speech-relaunch-operation", "attempt_id": "attempt-1", "correlation_id": "speech-quit-relaunch", "kind": "owner_joined", "payload": null}
+  ],
+  "durable_state": [
+    {
+      "state_id": "speech-receipts-after-quit",
+      "schema_id": "delysis.speech.fake_owner_receipt_store.v0",
+      "before": null,
+      "after": {"id": "speech-receipts-after-quit", "digest": {"algorithm": "sha256", "hex": "0b6dc3371daa9c459ee2dce20bced7f0aecf23e0962141bb2942503e93a58f80"}, "length": 670},
+      "disposition": "created"
+    },
+    {
+      "state_id": "speech-receipts-after-relaunch",
+      "schema_id": "delysis.speech.fake_owner_receipt_store.v0",
+      "before": {"id": "speech-receipts-after-quit", "digest": {"algorithm": "sha256", "hex": "0b6dc3371daa9c459ee2dce20bced7f0aecf23e0962141bb2942503e93a58f80"}, "length": 670},
+      "after": {"id": "speech-receipts-after-relaunch", "digest": {"algorithm": "sha256", "hex": "b5421de134c7649dfde284b621014630f922ba87b06b11152aea30da5fd307cd"}, "length": 1380},
+      "disposition": "updated"
+    }
+  ],
+  "lifecycle": [
+    {"operation_id": "speech-quit-operation", "attempt_id": "attempt-1", "correlation_id": "speech-quit-relaunch", "terminal": "cancelled", "released": true},
+    {"operation_id": "speech-relaunch-operation", "attempt_id": "attempt-1", "correlation_id": "speech-quit-relaunch", "terminal": "completed", "released": true}
+  ],
+  "ownership": {"active_operations": 0, "retained_tasks": 0, "expected_workers": 4, "joined_workers": 4},
+  "output_facts": {
+    "aborted_shutdown_caller_did_not_own_progress": {"kind": "boolean", "value": true},
+    "durable_receipts": {"kind": "integer", "value": 4},
+    "fresh_host_and_backend": {"kind": "boolean", "value": true},
+    "model_inference_invoked": {"kind": "boolean", "value": false},
+    "post_relaunch_completed": {"kind": "boolean", "value": true},
+    "quit_backend_expected_worker_ids": {"kind": "text", "value": "w1-speech-quit-owner:task-1:request:speech-quit-operation"},
+    "quit_backend_joined_worker_ids": {"kind": "text", "value": "w1-speech-quit-owner:task-1:request:speech-quit-operation"},
+    "quit_host_expected_worker_ids": {"kind": "text", "value": "task-supervisor:task-1:host-final-relay:speech-quit-operation"},
+    "quit_host_joined_worker_ids": {"kind": "text", "value": "task-supervisor:task-1:host-final-relay:speech-quit-operation"},
+    "relaunch_backend_expected_worker_ids": {"kind": "text", "value": "w1-speech-relaunch-owner:task-1:request:speech-relaunch-operation"},
+    "relaunch_backend_joined_worker_ids": {"kind": "text", "value": "w1-speech-relaunch-owner:task-1:request:speech-relaunch-operation"},
+    "relaunch_host_expected_worker_ids": {"kind": "text", "value": "task-supervisor:task-1:host-final-relay:speech-relaunch-operation"},
+    "relaunch_host_joined_worker_ids": {"kind": "text", "value": "task-supervisor:task-1:host-final-relay:speech-relaunch-operation"},
+    "same_durable_store_reopened": {"kind": "boolean", "value": true},
+    "worker_id_sets_match": {"kind": "boolean", "value": true}
+  },
+  "fail_closed_facts": [
+    "quit cancellation produces one authoritative terminal before owner join",
+    "shutdown acceptance requires every retained worker ID joined and zero orphan owner"
+  ]
+}

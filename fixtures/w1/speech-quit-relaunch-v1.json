@@ -1,0 +1,8 @@
+{
+  "schema": "delysis.speech.quit_relaunch_input.v0",
+  "quit_backend_id": "fixture-quit-owner.tts",
+  "quit_request_id": "speech-quit-operation",
+  "relaunch_backend_id": "fixture-relaunch-owner.tts",
+  "relaunch_request_id": "speech-relaunch-operation",
+  "receipt_file_name": "speech-fake-owner-receipts.jsonl"
+}

@@ -38,6 +38,28 @@ impl<'a> SpeechW1ContractAdapter<'a> {
     pub fn closed_summary(&self) -> Result<ClosedSummaryV0, SpeechHostError> {
         self.host.w1_closed_summary()
     }
+
+    /// Return the exact expected and joined host final-relay IDs.
+    pub fn closed_host_worker_ids(&self) -> Result<(Vec<String>, Vec<String>), SpeechHostError> {
+        let state = self
+            .host
+            .lifecycle
+            .state
+            .lock()
+            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        if state.phase != HostPhase::Closed {
+            return Err(SpeechHostError::StateUnavailable);
+        }
+        let tasks = &state
+            .shutdown_facts
+            .as_ref()
+            .ok_or(SpeechHostError::StateUnavailable)?
+            .tasks;
+        Ok((
+            tasks.expected_worker_ids.clone(),
+            tasks.joined_worker_ids.clone(),
+        ))
+    }
 }
 
 impl SpeechHost {
