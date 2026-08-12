@@ -25,14 +25,6 @@ pub struct SpeechW1ContractAdapter<'a> {
     host: &'a SpeechHost,
 }
 
-/// Feature-gated closed-host facts that retain exact host worker identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpeechW1ClosedFacts {
-    pub summary: ClosedSummaryV0,
-    pub host_expected_worker_ids: Vec<String>,
-    pub host_joined_worker_ids: Vec<String>,
-}
-
 impl<'a> SpeechW1ContractAdapter<'a> {
     #[must_use]
     pub const fn new(host: &'a SpeechHost) -> Self {
@@ -47,8 +39,26 @@ impl<'a> SpeechW1ContractAdapter<'a> {
         self.host.w1_closed_summary()
     }
 
-    pub fn closed_facts(&self) -> Result<SpeechW1ClosedFacts, SpeechHostError> {
-        self.host.w1_closed_facts()
+    /// Return the exact expected and joined host final-relay IDs.
+    pub fn closed_host_worker_ids(&self) -> Result<(Vec<String>, Vec<String>), SpeechHostError> {
+        let state = self
+            .host
+            .lifecycle
+            .state
+            .lock()
+            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        if state.phase != HostPhase::Closed {
+            return Err(SpeechHostError::StateUnavailable);
+        }
+        let tasks = &state
+            .shutdown_facts
+            .as_ref()
+            .ok_or(SpeechHostError::StateUnavailable)?
+            .tasks;
+        Ok((
+            tasks.expected_worker_ids.clone(),
+            tasks.joined_worker_ids.clone(),
+        ))
     }
 }
 
@@ -222,31 +232,6 @@ impl SpeechHost {
             .validate()
             .map_err(|_| SpeechHostError::StateUnavailable)?;
         Ok(summary)
-    }
-
-    /// Retain the exact host final-relay IDs alongside the canonical summary.
-    pub fn w1_closed_facts(&self) -> Result<SpeechW1ClosedFacts, SpeechHostError> {
-        let summary = self.w1_closed_summary()?;
-        let state = self
-            .lifecycle
-            .state
-            .lock()
-            .map_err(|_| SpeechHostError::StateUnavailable)?;
-        let tasks = &state
-            .shutdown_facts
-            .as_ref()
-            .ok_or(SpeechHostError::StateUnavailable)?
-            .tasks;
-        if tasks.expected_worker_ids.len() != summary.expected_workers
-            || tasks.joined_worker_ids.len() != summary.joined_workers
-        {
-            return Err(SpeechHostError::StateUnavailable);
-        }
-        Ok(SpeechW1ClosedFacts {
-            summary,
-            host_expected_worker_ids: tasks.expected_worker_ids.clone(),
-            host_joined_worker_ids: tasks.joined_worker_ids.clone(),
-        })
     }
 }
 

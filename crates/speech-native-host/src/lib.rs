@@ -23,7 +23,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 #[cfg(feature = "unstable-w1-contract-tests")]
 mod w1_contracts;
 #[cfg(feature = "unstable-w1-contract-tests")]
-pub use w1_contracts::{SpeechW1ClosedFacts, SpeechW1ContractAdapter};
+pub use w1_contracts::SpeechW1ContractAdapter;
 #[cfg(all(test, feature = "unstable-w1-contract-tests"))]
 mod w1_lifecycle_tests;
 
