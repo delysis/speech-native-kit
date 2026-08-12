@@ -2274,15 +2274,16 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "platform-contract-testkit"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=da22fa893ac183c5d9df972a7e67215c0d92b383#da22fa893ac183c5d9df972a7e67215c0d92b383"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
 dependencies = [
  "platform-contracts-v0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "platform-contracts-v0"
 version = "0.0.0"
-source = "git+https://github.com/delysis/w1-platform-contracts?rev=da22fa893ac183c5d9df972a7e67215c0d92b383#da22fa893ac183c5d9df972a7e67215c0d92b383"
+source = "git+https://github.com/delysis/w1-platform-contracts?rev=cbab33555ab9355a6ac453d659c55ec9e0666821#cbab33555ab9355a6ac453d659c55ec9e0666821"
 dependencies = [
  "serde",
  "thiserror 2.0.20",

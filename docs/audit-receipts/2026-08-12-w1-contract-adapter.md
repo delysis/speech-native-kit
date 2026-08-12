@@ -1,33 +1,47 @@
 # W1 Speech contract adapter receipt — 2026-08-12
 
 This candidate starts from exact `speech-native-kit` commit
-`c78f59fd9ee2c5a27baf89aea96946c6e3a79b97` and consumes the temporary W1
+`c78f59fd9ee2c5a27baf89aea96946c6e3a79b97` and consumes the canonical W1
 contract repository only at immutable revision
-`da22fa893ac183c5d9df972a7e67215c0d92b383`.
+`cbab33555ab9355a6ac453d659c55ec9e0666821` (`w1-contracts-v0-2026-08-12-r3`).
 
-The `unstable-w1-contract-tests` feature projects the real registered backend
-descriptors, host active-operation registry, retained shutdown result, backend
-shutdown outcomes, and task-supervisor admitted/completed counters into the v0
-capability and closed-summary envelopes. It creates no second operation map and
-grants no credential, path, network, or runtime authority.
+The declared lifecycle implementation is `speech-native-kit/speech-host-v1`.
+Ordinary transcription and synthesis use its production operation registry for
+generation-safe reservation, queue/start, one backend attempt, cancellation,
+terminal classification, and executor release. Setup rollback and finalization
+are checked transactions. Registry or host-state failure is observable in the
+consumer result and shutdown result; mutex poison never becomes empty success.
 
-The contract-enabled tests prove that the capability projection validates,
-shutdown attempts every registered backend exactly once, multiple backend
-failures remain distinct, the active operation and retained task counts are
-zero after shutdown, and expected/completed host relay counts agree. Existing
-host tests separately prove exact request nonce ownership, consumer-drop
-cancellation, duplicate rejection, nonce exhaustion, self-reaping of 10,000
-operations, panic retention, shutdown cancellation, repeated shutdown, and
-waiting for backend final completion.
+The complete manifest accepts exactly eleven suite results and all eighteen
+normative invariants. Component suites exercise the production registry.
+Bridge suites cross real `SpeechHost` admission, ticket-drop control, bounded
+Tokio event channels, host final relays, backend-owned `TaskSupervisor` tasks,
+and host shutdown. Expected worker IDs come from actual supervisor admission;
+joined IDs are recorded only after a retained join task has awaited the worker
+handle; when active reaches zero, the retained join-handle map must also be
+empty or the supervisor fails closed. No adapter-owned active map, completion
+counter, worker identity, or lifecycle phase is used as evidence.
 
-The generic synchronous lifecycle suite is intentionally not claimed. Speech
-admission and terminal delivery are asynchronous and do not expose separate
-Reserved/Queued transitions. Adapting those tests would require a shadow state
-machine rather than exercising the host. Backend resources report that their
-shutdown future completed or failed; native Apple and Parakeet worker join
-proof remains in their explicitly named backend lifecycle tests and real-smoke
-receipts because the host does not own those private worker registries.
+Attempt hierarchy is exercised through the production registry API; ordinary
+Speech traffic currently starts one backend attempt per public request.
+Progress conformance publishes to both the admitted production lease and a real
+bounded backend event channel; ordinary host traffic forwards backend events
+but does not itself call `publish_progress` on the registry.
 
-Real Apple and Parakeet inference are not fixture contract tests. Their current
-evidence remains separately named in `2026-08-11-r2-speech-reap.md` and
-`2026-08-10-real-parakeet.md`.
+Capability fixtures remain deterministic, local, and network-never. They make
+no Apple, Parakeet, hosted-provider, credential, or real-inference claim. Real
+Apple and Parakeet evidence remains separately named in
+`2026-08-11-r2-speech-reap.md` and `2026-08-10-real-parakeet.md`.
+
+Shutdown envelope resources contain no dummy operation worker. Host relay
+counts and IDs come from the production task supervisor. Generic backend
+resources truthfully report zero known worker IDs because the backend trait
+exposes only the awaited shutdown result, not a backend-private worker
+registry; an awaited future is not counted as a worker. The full bridge
+manifest separately uses controlled backends whose real task supervisors
+expose exact worker IDs.
+
+Verification is run under the repository's Rust 1.88 default lane and the
+contract lane's Rust 1.92 toolchain. The real Parakeet and launched Apple UI
+tests remain explicitly ignored unless their documented hardware/assets are
+available; they are not promoted by contract-fixture success.

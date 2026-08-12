@@ -105,34 +105,42 @@ impl SpeechHost {
             .state
             .lock()
             .map_err(|_| SpeechHostError::StateUnavailable)?;
-        if state.phase != HostPhase::Closed || !state.active.is_empty() {
+        let active_operations = self
+            .lifecycle
+            .operations
+            .active_count()
+            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        if state.phase != HostPhase::Closed
+            || active_operations != 0
+            || !state.routes.is_empty()
+            || self
+                .lifecycle
+                .faulted
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self.lifecycle.operations.diagnostic_faulted()
+        {
             return Err(SpeechHostError::StateUnavailable);
         }
         let facts = state
             .shutdown_facts
             .as_ref()
             .ok_or(SpeechHostError::StateUnavailable)?;
-        let mut resources = vec![ShutdownResourceV0 {
-            resource_id: "speech.host.operations".to_owned(),
-            service: service_id("speech-host")?,
-            kind: ShutdownResourceKind::OperationRegistry,
-            state: ShutdownResourceState::Stopped,
-            expected_workers: 0,
-            joined_workers: 0,
-        }];
+        let mut resources = Vec::new();
         let monitor_failed = facts.monitor_failure.is_some();
-        resources.push(ShutdownResourceV0 {
-            resource_id: "speech.host.final-relays".to_owned(),
-            service: service_id("speech-host")?,
-            kind: ShutdownResourceKind::TaskSupervisor,
-            state: if monitor_failed {
-                ShutdownResourceState::Failed
-            } else {
-                ShutdownResourceState::Stopped
-            },
-            expected_workers: facts.tasks.admitted_tasks,
-            joined_workers: facts.tasks.completed_tasks,
-        });
+        if !facts.tasks.expected_worker_ids.is_empty() {
+            resources.push(ShutdownResourceV0 {
+                resource_id: "speech.host.final-relays".to_owned(),
+                service: service_id("speech-host")?,
+                kind: ShutdownResourceKind::TaskSupervisor,
+                state: if monitor_failed {
+                    ShutdownResourceState::Failed
+                } else {
+                    ShutdownResourceState::Stopped
+                },
+                expected_workers: facts.tasks.expected_worker_ids.len(),
+                joined_workers: facts.tasks.joined_worker_ids.len(),
+            });
+        }
 
         let mut failures = Vec::new();
         if let Some(summary) = &facts.monitor_failure {
@@ -165,6 +173,9 @@ impl SpeechHost {
                 } else {
                     ShutdownResourceState::Stopped
                 },
+                // The host observed the backend shutdown call return, but the
+                // generic backend trait exposes no private worker identities.
+                // Do not turn one awaited future into invented worker facts.
                 expected_workers: 0,
                 joined_workers: 0,
             });
@@ -188,7 +199,7 @@ impl SpeechHost {
         let summary = ClosedSummaryV0 {
             schema: CLOSED_SUMMARY_SCHEMA_V0.to_owned(),
             phase: SupervisorPhase::Closed,
-            active_operations: state.active.len(),
+            active_operations,
             retained_tasks: facts.tasks.active,
             expected_workers,
             joined_workers,

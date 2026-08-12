@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-expected_rev=da22fa893ac183c5d9df972a7e67215c0d92b383
+expected_rev=cbab33555ab9355a6ac453d659c55ec9e0666821
 manifest="$repo_root/crates/speech-native-host/Cargo.toml"
 lockfile="$repo_root/Cargo.lock"
 

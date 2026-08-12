@@ -24,6 +24,10 @@ use tokio::sync::{Notify, mpsc, oneshot};
 mod w1_contracts;
 #[cfg(feature = "unstable-w1-contract-tests")]
 pub use w1_contracts::SpeechW1ContractAdapter;
+#[cfg(all(test, feature = "unstable-w1-contract-tests"))]
+mod w1_lifecycle_tests;
+
+pub mod operation_lifecycle;
 
 const REGISTERED_SOURCE_ID: &str = "registered-speech-backends";
 
@@ -83,17 +87,16 @@ enum HostPhase {
     Closed,
 }
 
-struct ActiveSpeechOperation {
+struct ActiveRoute {
     backend: Arc<dyn SpeechBackend>,
-    nonce: u64,
-    cancellation_requested: AtomicBool,
+    identity: operation_lifecycle::OperationIdentity,
 }
 
 struct HostState {
     phase: HostPhase,
-    next_nonce: u64,
+    shutdown_started: bool,
     backends: BTreeMap<String, Arc<dyn SpeechBackend>>,
-    active: BTreeMap<SpeechRequestId, Arc<ActiveSpeechOperation>>,
+    routes: BTreeMap<SpeechRequestId, ActiveRoute>,
     shutdown_result: Option<Result<(), SpeechHostError>>,
     #[cfg(feature = "unstable-w1-contract-tests")]
     shutdown_facts: Option<HostShutdownFacts>,
@@ -116,6 +119,8 @@ struct BackendShutdownFact {
 
 struct HostLifecycle {
     state: Mutex<HostState>,
+    operations: operation_lifecycle::OperationRegistry,
+    faulted: AtomicBool,
     changed: Notify,
     tasks: Arc<TaskSupervisor>,
 }
@@ -123,19 +128,23 @@ struct HostLifecycle {
 struct HostCancellation {
     lifecycle: Weak<HostLifecycle>,
     request_id: SpeechRequestId,
-    nonce: u64,
-}
-
-struct OperationLease {
-    lifecycle: Arc<HostLifecycle>,
-    request_id: SpeechRequestId,
-    nonce: u64,
+    identity: operation_lifecycle::OperationIdentity,
+    _consumer: operation_lifecycle::ConsumerGuard,
 }
 
 struct ReservedRoute {
     plan: SpeechRoutePlan,
     backend: Arc<dyn SpeechBackend>,
-    operation: Arc<ActiveSpeechOperation>,
+    consumer: operation_lifecycle::ConsumerGuard,
+    operation: operation_lifecycle::OperationLease,
+}
+
+struct ExecutorOperation {
+    lifecycle: Arc<HostLifecycle>,
+    request_id: SpeechRequestId,
+    operation: operation_lifecycle::OperationLease,
+    attempt: Option<operation_lifecycle::AttemptLease>,
+    finished: bool,
 }
 
 impl std::fmt::Debug for SpeechHost {
@@ -162,13 +171,15 @@ impl SpeechHost {
             lifecycle: Arc::new(HostLifecycle {
                 state: Mutex::new(HostState {
                     phase: HostPhase::Running,
-                    next_nonce: 0,
+                    shutdown_started: false,
                     backends: BTreeMap::new(),
-                    active: BTreeMap::new(),
+                    routes: BTreeMap::new(),
                     shutdown_result: None,
                     #[cfg(feature = "unstable-w1-contract-tests")]
                     shutdown_facts: None,
                 }),
+                operations: operation_lifecycle::OperationRegistry::default(),
+                faulted: AtomicBool::new(false),
                 changed: Notify::new(),
                 tasks: Arc::new(TaskSupervisor::default()),
             }),
@@ -182,11 +193,10 @@ impl SpeechHost {
             .map_err(|error| SpeechHostError::BackendInvalid {
                 detail: error.to_string(),
             })?;
-        let mut state = self
-            .lifecycle
-            .state
-            .lock()
-            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        let mut state = self.lifecycle.state.lock().map_err(|_| {
+            self.lifecycle.mark_faulted();
+            SpeechHostError::StateUnavailable
+        })?;
         if state.phase != HostPhase::Running {
             return Err(SpeechHostError::AdmissionClosed);
         }
@@ -207,11 +217,10 @@ impl SpeechHost {
     }
 
     pub fn descriptors(&self) -> Result<Vec<SpeechBackendDescriptor>, SpeechHostError> {
-        let state = self
-            .lifecycle
-            .state
-            .lock()
-            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        let state = self.lifecycle.state.lock().map_err(|_| {
+            self.lifecycle.mark_faulted();
+            SpeechHostError::StateUnavailable
+        })?;
         Ok(state
             .backends
             .values()
@@ -256,17 +265,41 @@ impl SpeechHost {
         let ReservedRoute {
             plan,
             backend,
+            consumer,
             operation,
         } = self.reserve_transcription(&request)?;
         pin_route(&mut request.context.route, &plan);
+        let attempt = match operation
+            .queue()
+            .and_then(|()| operation.start())
+            .and_then(|()| operation.start_attempt())
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Err(self.rollback_setup(&request_id, &operation, error));
+            }
+        };
+        let mut executor = ExecutorOperation {
+            lifecycle: Arc::clone(&self.lifecycle),
+            request_id: request_id.clone(),
+            operation: operation.clone(),
+            attempt: Some(attempt),
+            finished: false,
+        };
         let mut backend_ticket = match backend.transcribe(request).await {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.lifecycle.release(&request_id, operation.nonce);
+                executor
+                    .finish(terminal_for_error(&error))
+                    .map_err(map_registry_error)?;
                 return Err(error.into());
             }
         };
-        if operation.cancellation_requested.load(Ordering::Acquire) {
+        if operation
+            .snapshot()
+            .map_err(map_registry_error)?
+            .is_some_and(|snapshot| snapshot.cancellation_requested)
+        {
             backend.cancel(&request_id);
         }
 
@@ -276,17 +309,19 @@ impl SpeechHost {
         let cancellation = Arc::new(HostCancellation {
             lifecycle: Arc::downgrade(&self.lifecycle),
             request_id: request_id.clone(),
-            nonce: operation.nonce,
+            identity: operation.identity(),
+            _consumer: consumer,
         });
-        let lease = OperationLease {
-            lifecycle: Arc::clone(&self.lifecycle),
-            request_id: request_id.clone(),
-            nonce: operation.nonce,
-        };
-        self.spawn_monitor(async move {
+        let monitor_request_id = request_id.clone();
+        self.spawn_monitor(format!("host-final-relay:{request_id}"), async move {
             let result = backend_ticket.final_response().await;
-            let _ = final_sender.send(result);
-            drop(lease);
+            let finalized = executor.finish(terminal_for_result(&result));
+            let delivered = match finalized {
+                Ok(()) => result,
+                Err(ref error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
+            };
+            let _consumer_gone = final_sender.send(delivered).is_err();
+            finalized.map_err(|error| error.to_string())
         })?;
         Ok(TranscriptionTicket::new(
             request_id,
@@ -305,17 +340,41 @@ impl SpeechHost {
         let ReservedRoute {
             plan,
             backend,
+            consumer,
             operation,
         } = self.reserve_synthesis(&request)?;
         pin_route(&mut request.context.route, &plan);
+        let attempt = match operation
+            .queue()
+            .and_then(|()| operation.start())
+            .and_then(|()| operation.start_attempt())
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Err(self.rollback_setup(&request_id, &operation, error));
+            }
+        };
+        let mut executor = ExecutorOperation {
+            lifecycle: Arc::clone(&self.lifecycle),
+            request_id: request_id.clone(),
+            operation: operation.clone(),
+            attempt: Some(attempt),
+            finished: false,
+        };
         let mut backend_ticket = match backend.synthesize(request).await {
             Ok(ticket) => ticket,
             Err(error) => {
-                self.lifecycle.release(&request_id, operation.nonce);
+                executor
+                    .finish(terminal_for_error(&error))
+                    .map_err(map_registry_error)?;
                 return Err(error.into());
             }
         };
-        if operation.cancellation_requested.load(Ordering::Acquire) {
+        if operation
+            .snapshot()
+            .map_err(map_registry_error)?
+            .is_some_and(|snapshot| snapshot.cancellation_requested)
+        {
             backend.cancel(&request_id);
         }
 
@@ -324,17 +383,19 @@ impl SpeechHost {
         let cancellation = Arc::new(HostCancellation {
             lifecycle: Arc::downgrade(&self.lifecycle),
             request_id: request_id.clone(),
-            nonce: operation.nonce,
+            identity: operation.identity(),
+            _consumer: consumer,
         });
-        let lease = OperationLease {
-            lifecycle: Arc::clone(&self.lifecycle),
-            request_id: request_id.clone(),
-            nonce: operation.nonce,
-        };
-        self.spawn_monitor(async move {
+        let monitor_request_id = request_id.clone();
+        self.spawn_monitor(format!("host-final-relay:{request_id}"), async move {
             let result = backend_ticket.final_response().await;
-            let _ = final_sender.send(result);
-            drop(lease);
+            let finalized = executor.finish(terminal_for_result(&result));
+            let delivered = match finalized {
+                Ok(()) => result,
+                Err(ref error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
+            };
+            let _consumer_gone = final_sender.send(delivered).is_err();
+            finalized.map_err(|error| error.to_string())
         })?;
         Ok(SynthesisTicket::new(
             request_id,
@@ -349,24 +410,78 @@ impl SpeechHost {
         self.lifecycle.cancel(request_id, None)
     }
 
+    pub fn quiesce(&self) -> Result<(), SpeechHostError> {
+        let active = {
+            let mut state = self.lifecycle.state.lock().map_err(|_| {
+                self.lifecycle.mark_faulted();
+                SpeechHostError::StateUnavailable
+            })?;
+            if state.phase != HostPhase::Running {
+                return Ok(());
+            }
+            let cancelled = self
+                .lifecycle
+                .operations
+                .request_cancel_all()
+                .map_err(map_registry_error)?;
+            state.phase = HostPhase::Quiescing;
+            cancelled
+                .into_iter()
+                .filter_map(|operation_id| {
+                    let request_id = SpeechRequestId(operation_id);
+                    state
+                        .routes
+                        .get(&request_id)
+                        .map(|route| (request_id, Arc::clone(&route.backend)))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (request_id, backend) in active {
+            backend.cancel(&request_id);
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> Result<(), SpeechHostError> {
         let (leader, backends, active) = {
-            let mut state = self
-                .lifecycle
-                .state
-                .lock()
-                .map_err(|_| SpeechHostError::StateUnavailable)?;
+            let mut state = self.lifecycle.state.lock().map_err(|_| {
+                self.lifecycle.mark_faulted();
+                SpeechHostError::StateUnavailable
+            })?;
             match state.phase {
                 HostPhase::Running => {
+                    let cancelled = self
+                        .lifecycle
+                        .operations
+                        .request_cancel_all()
+                        .map_err(map_registry_error)?;
                     state.phase = HostPhase::Quiescing;
+                    state.shutdown_started = true;
+                    (
+                        true,
+                        state.backends.values().cloned().collect::<Vec<_>>(),
+                        cancelled
+                            .into_iter()
+                            .filter_map(|operation_id| {
+                                let request_id = SpeechRequestId(operation_id);
+                                state
+                                    .routes
+                                    .get(&request_id)
+                                    .map(|route| (request_id, Arc::clone(&route.backend)))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }
+                HostPhase::Quiescing if !state.shutdown_started => {
+                    state.shutdown_started = true;
                     (
                         true,
                         state.backends.values().cloned().collect::<Vec<_>>(),
                         state
-                            .active
+                            .routes
                             .iter()
-                            .map(|(request_id, operation)| {
-                                (request_id.clone(), Arc::clone(operation))
+                            .map(|(request_id, route)| {
+                                (request_id.clone(), Arc::clone(&route.backend))
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -384,16 +499,15 @@ impl SpeechHost {
             return self.wait_for_shutdown().await;
         }
 
-        self.lifecycle
+        let mut infrastructure_error = self
+            .lifecycle
             .tasks
             .begin_shutdown()
-            .map_err(map_task_supervisor_error)?;
+            .err()
+            .map(map_task_supervisor_error);
 
-        for (request_id, operation) in active {
-            operation
-                .cancellation_requested
-                .store(true, Ordering::Release);
-            operation.backend.cancel(&request_id);
+        for (request_id, backend) in active {
+            backend.cancel(&request_id);
         }
         let mut failures = Vec::new();
         #[cfg(feature = "unstable-w1-contract-tests")]
@@ -406,17 +520,19 @@ impl SpeechHost {
             #[cfg(feature = "unstable-w1-contract-tests")]
             backend_facts.push(BackendShutdownFact { backend_id, error });
         }
-        self.wait_for_active_empty().await?;
-        self.lifecycle
-            .tasks
-            .wait_for_idle()
-            .await
-            .map_err(map_task_supervisor_error)?;
-        let monitor_failure = self
-            .lifecycle
-            .tasks
-            .failure_summary()
-            .map_err(map_task_supervisor_error)?;
+        if let Err(error) = self.wait_for_active_empty().await {
+            infrastructure_error.get_or_insert(error);
+        }
+        if let Err(error) = self.lifecycle.tasks.wait_for_idle().await {
+            infrastructure_error.get_or_insert(map_task_supervisor_error(error));
+        }
+        let monitor_failure = match self.lifecycle.tasks.failure_summary() {
+            Ok(failure) => failure,
+            Err(error) => {
+                infrastructure_error.get_or_insert(map_task_supervisor_error(error));
+                None
+            }
+        };
         if let Some(summary) = &monitor_failure {
             let additional = summary.additional_failures;
             let first = &summary.first;
@@ -429,29 +545,38 @@ impl SpeechHost {
                 ),
             ));
         }
-        let result = if failures.is_empty() {
+        if self.lifecycle.faulted.load(Ordering::Acquire)
+            || self.lifecycle.operations.diagnostic_faulted()
+        {
+            failures.push(SpeechError::unavailable(
+                &SpeechRequestId("speech-host-lifecycle".to_owned()),
+                "speech_host_lifecycle_failed",
+                "speech host lifecycle ownership encountered an internal state failure",
+            ));
+        }
+        let result = if let Some(error) = infrastructure_error {
+            Err(error)
+        } else if failures.is_empty() {
             Ok(())
         } else {
             Err(SpeechHostError::Shutdown { failures })
         };
         #[cfg(feature = "unstable-w1-contract-tests")]
-        let task_snapshot = self
-            .lifecycle
-            .tasks
-            .snapshot()
-            .map_err(map_task_supervisor_error)?;
+        let (result, task_snapshot) = match self.lifecycle.tasks.snapshot() {
+            Ok(snapshot) => (result, Some(snapshot)),
+            Err(error) => (Err(map_task_supervisor_error(error)), None),
+        };
         {
-            let mut state = self
-                .lifecycle
-                .state
-                .lock()
-                .map_err(|_| SpeechHostError::StateUnavailable)?;
+            let mut state = self.lifecycle.state.lock().map_err(|_| {
+                self.lifecycle.mark_faulted();
+                SpeechHostError::StateUnavailable
+            })?;
             state.shutdown_result = Some(result.clone());
             #[cfg(feature = "unstable-w1-contract-tests")]
             {
-                state.shutdown_facts = Some(HostShutdownFacts {
+                state.shutdown_facts = task_snapshot.map(|tasks| HostShutdownFacts {
                     backends: backend_facts,
-                    tasks: task_snapshot,
+                    tasks,
                     monitor_failure,
                 });
             }
@@ -484,15 +609,14 @@ impl SpeechHost {
         request_id: SpeechRequestId,
         plan: impl FnOnce(&PlatformCapabilitySnapshot) -> Result<SpeechRoutePlan, SpeechRouteError>,
     ) -> Result<ReservedRoute, SpeechHostError> {
-        let mut state = self
-            .lifecycle
-            .state
-            .lock()
-            .map_err(|_| SpeechHostError::StateUnavailable)?;
+        let mut state = self.lifecycle.state.lock().map_err(|_| {
+            self.lifecycle.mark_faulted();
+            SpeechHostError::StateUnavailable
+        })?;
         if state.phase != HostPhase::Running {
             return Err(SpeechHostError::AdmissionClosed);
         }
-        if state.active.contains_key(&request_id) {
+        if state.routes.contains_key(&request_id) {
             return Err(SpeechHostError::RequestDuplicate { request_id });
         }
         let snapshot = snapshot_from_backends(self.target.clone(), &state.backends);
@@ -503,47 +627,74 @@ impl SpeechHost {
                 backend_id: backend_id.clone(),
             }
         })?;
-        let nonce = state.next_nonce;
-        state.next_nonce = state
-            .next_nonce
-            .checked_add(1)
-            .ok_or(SpeechHostError::NonceExhausted)?;
-        let operation = Arc::new(ActiveSpeechOperation {
-            backend: Arc::clone(&backend),
-            nonce,
-            cancellation_requested: AtomicBool::new(false),
-        });
-        state.active.insert(request_id, Arc::clone(&operation));
+        let (consumer, operation) = self
+            .lifecycle
+            .operations
+            .reserve(&request_id.0)
+            .map_err(map_registry_error)?;
+        state.routes.insert(
+            request_id,
+            ActiveRoute {
+                backend: Arc::clone(&backend),
+                identity: operation.identity(),
+            },
+        );
         Ok(ReservedRoute {
             plan: route,
             backend,
+            consumer,
             operation,
         })
     }
 
     fn spawn_monitor(
         &self,
-        monitor: impl Future<Output = ()> + Send + 'static,
+        label: String,
+        monitor: impl Future<Output = Result<(), String>> + Send + 'static,
     ) -> Result<(), SpeechHostError> {
         self.lifecycle
             .tasks
-            .spawn("host-final-relay", async move {
-                monitor.await;
-                Ok(())
-            })
+            .spawn(label, monitor)
             .map_err(map_task_supervisor_error)
+    }
+
+    fn rollback_setup(
+        &self,
+        request_id: &SpeechRequestId,
+        operation: &operation_lifecycle::OperationLease,
+        setup_error: operation_lifecycle::RegistryError,
+    ) -> SpeechHostError {
+        self.lifecycle.mark_faulted();
+        match operation.fail_setup_and_release() {
+            Ok(_) => {
+                if self
+                    .lifecycle
+                    .release_route(request_id, &operation.identity())
+                    .is_ok()
+                {
+                    map_registry_error(setup_error)
+                } else {
+                    SpeechHostError::StateUnavailable
+                }
+            }
+            Err(_) => SpeechHostError::StateUnavailable,
+        }
     }
 
     async fn wait_for_active_empty(&self) -> Result<(), SpeechHostError> {
         loop {
             let changed = self.lifecycle.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.lifecycle.is_faulted() {
+                return Err(SpeechHostError::StateUnavailable);
+            }
             if self
                 .lifecycle
-                .state
-                .lock()
-                .map_err(|_| SpeechHostError::StateUnavailable)?
-                .active
-                .is_empty()
+                .operations
+                .active_count()
+                .map_err(map_registry_error)?
+                == 0
             {
                 return Ok(());
             }
@@ -554,16 +705,20 @@ impl SpeechHost {
     async fn wait_for_shutdown(&self) -> Result<(), SpeechHostError> {
         loop {
             let changed = self.lifecycle.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let result = {
-                let state = self
-                    .lifecycle
-                    .state
-                    .lock()
-                    .map_err(|_| SpeechHostError::StateUnavailable)?;
+                let state = self.lifecycle.state.lock().map_err(|_| {
+                    self.lifecycle.mark_faulted();
+                    SpeechHostError::StateUnavailable
+                })?;
                 (state.phase == HostPhase::Closed).then(|| state.shutdown_result.clone())
             };
             if let Some(result) = result {
                 return result.unwrap_or(Err(SpeechHostError::StateUnavailable));
+            }
+            if self.lifecycle.is_faulted() {
+                return Err(SpeechHostError::StateUnavailable);
             }
             changed.await;
         }
@@ -579,34 +734,102 @@ fn map_task_supervisor_error(error: TaskSupervisorError) -> SpeechHostError {
     }
 }
 
+fn map_registry_error(error: operation_lifecycle::RegistryError) -> SpeechHostError {
+    match error {
+        operation_lifecycle::RegistryError::Duplicate => SpeechHostError::StateUnavailable,
+        operation_lifecycle::RegistryError::Exhausted => SpeechHostError::NonceExhausted,
+        operation_lifecycle::RegistryError::Stale
+        | operation_lifecycle::RegistryError::InvalidTransition
+        | operation_lifecycle::RegistryError::StateUnavailable => SpeechHostError::StateUnavailable,
+    }
+}
+
+fn lifecycle_speech_error(
+    request_id: &SpeechRequestId,
+    error: &operation_lifecycle::RegistryError,
+) -> SpeechError {
+    SpeechError::unavailable(
+        request_id,
+        "speech_lifecycle_finalization_failed",
+        &format!("speech lifecycle finalization failed: {error}"),
+    )
+}
+
 impl HostLifecycle {
-    fn cancel(&self, request_id: &SpeechRequestId, nonce: Option<u64>) -> usize {
-        let operation = self.state.lock().ok().and_then(|state| {
-            state.active.get(request_id).and_then(|operation| {
-                nonce
-                    .is_none_or(|nonce| nonce == operation.nonce)
-                    .then(|| Arc::clone(operation))
-            })
-        });
-        operation.map_or(0, |operation| {
-            operation
-                .cancellation_requested
-                .store(true, Ordering::Release);
-            operation.backend.cancel(request_id);
-            1
-        })
+    fn mark_faulted(&self) {
+        self.faulted.store(true, Ordering::Release);
+        self.changed.notify_waiters();
     }
 
-    fn release(&self, request_id: &SpeechRequestId, nonce: u64) {
-        if let Ok(mut state) = self.state.lock()
-            && state
-                .active
-                .get(request_id)
-                .is_some_and(|operation| operation.nonce == nonce)
-        {
-            state.active.remove(request_id);
-            self.changed.notify_waiters();
+    fn is_faulted(&self) -> bool {
+        self.faulted.load(Ordering::Acquire)
+            || self.operations.diagnostic_faulted()
+            || self.tasks.diagnostic_faulted()
+    }
+
+    fn cancel(
+        &self,
+        request_id: &SpeechRequestId,
+        identity: Option<&operation_lifecycle::OperationIdentity>,
+    ) -> usize {
+        let route = match self.state.lock() {
+            Ok(state) => state.routes.get(request_id).and_then(|route| {
+                identity
+                    .is_none_or(|identity| identity == &route.identity)
+                    .then(|| (Arc::clone(&route.backend), route.identity.clone()))
+            }),
+            Err(_) => {
+                self.mark_faulted();
+                return 0;
+            }
+        };
+        let Some((backend, route_identity)) = route else {
+            return 0;
+        };
+        let operation = match self.operations.current_lease(&request_id.0) {
+            Ok(Some(operation)) => operation,
+            Ok(None) => return 0,
+            Err(_) => {
+                self.mark_faulted();
+                return 0;
+            }
+        };
+        if route_identity != operation.identity() {
+            self.mark_faulted();
+            return 0;
         }
+        if identity.is_some_and(|identity| identity != &operation.identity())
+            || operation.request_cancel().is_err()
+        {
+            if self.operations.diagnostic_faulted() {
+                self.mark_faulted();
+            }
+            return 0;
+        }
+        backend.cancel(request_id);
+        1
+    }
+
+    fn release_route(
+        &self,
+        request_id: &SpeechRequestId,
+        identity: &operation_lifecycle::OperationIdentity,
+    ) -> Result<(), SpeechHostError> {
+        let mut state = self.state.lock().map_err(|_| {
+            self.mark_faulted();
+            SpeechHostError::StateUnavailable
+        })?;
+        if !state
+            .routes
+            .get(request_id)
+            .is_some_and(|route| &route.identity == identity)
+        {
+            self.mark_faulted();
+            return Err(SpeechHostError::StateUnavailable);
+        }
+        state.routes.remove(request_id);
+        self.changed.notify_waiters();
+        Ok(())
     }
 }
 
@@ -615,15 +838,65 @@ impl SpeechCancellation for HostCancellation {
         if request_id != &self.request_id {
             return 0;
         }
-        self.lifecycle.upgrade().map_or(0, |lifecycle| {
-            lifecycle.cancel(request_id, Some(self.nonce))
-        })
+        let Some(lifecycle) = self.lifecycle.upgrade() else {
+            return 0;
+        };
+        lifecycle.cancel(request_id, Some(&self.identity))
     }
 }
 
-impl Drop for OperationLease {
+impl ExecutorOperation {
+    fn finish(
+        &mut self,
+        terminal: operation_lifecycle::TerminalClass,
+    ) -> Result<(), operation_lifecycle::RegistryError> {
+        if self.finished {
+            return Err(operation_lifecycle::RegistryError::Stale);
+        }
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or(operation_lifecycle::RegistryError::Stale)?;
+        if let Err(error) = self.operation.finish_attempt_and_release(attempt, terminal) {
+            self.lifecycle.mark_faulted();
+            return Err(error);
+        }
+        self.attempt.take();
+        let identity = self.operation.identity();
+        self.lifecycle
+            .release_route(&self.request_id, &identity)
+            .map_err(|_| operation_lifecycle::RegistryError::StateUnavailable)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for ExecutorOperation {
     fn drop(&mut self) {
-        self.lifecycle.release(&self.request_id, self.nonce);
+        if !self.finished {
+            self.lifecycle.mark_faulted();
+            if self
+                .finish(operation_lifecycle::TerminalClass::Failed)
+                .is_err()
+            {
+                self.lifecycle.mark_faulted();
+            }
+        }
+    }
+}
+
+fn terminal_for_result<T>(result: &Result<T, SpeechError>) -> operation_lifecycle::TerminalClass {
+    match result {
+        Ok(_) => operation_lifecycle::TerminalClass::Completed,
+        Err(error) => terminal_for_error(error),
+    }
+}
+
+const fn terminal_for_error(error: &SpeechError) -> operation_lifecycle::TerminalClass {
+    if matches!(error.class, SpeechErrorClass::Cancelled) {
+        operation_lifecycle::TerminalClass::Cancelled
+    } else {
+        operation_lifecycle::TerminalClass::Failed
     }
 }
 
@@ -1148,11 +1421,10 @@ mod tests {
             let changed = host.lifecycle.changed.notified();
             if host
                 .lifecycle
-                .state
-                .lock()
-                .expect("lock host state")
-                .active
-                .is_empty()
+                .operations
+                .active_count()
+                .expect("read active operations")
+                == 0
             {
                 break;
             }
@@ -1215,6 +1487,70 @@ mod tests {
             host.synthesize(exact_request("late", "deferred.tts")).await,
             Err(SpeechHostError::AdmissionClosed)
         ));
+    }
+
+    #[tokio::test]
+    async fn poisoned_finalization_fails_consumer_and_shutdown_without_hanging() {
+        let host = Arc::new(SpeechHost::default());
+        let backend = deferred_backend("poisoned-finalization.tts");
+        host.register_backend(backend.clone())
+            .expect("register deferred backend");
+        let request_id = SpeechRequestId("poisoned-finalization".to_owned());
+        let ticket = host
+            .synthesize(exact_request(&request_id.0, "poisoned-finalization.tts"))
+            .await
+            .expect("start deferred request");
+        host.lifecycle
+            .operations
+            .current_lease(&request_id.0)
+            .expect("read production operation registry")
+            .expect("operation is active")
+            .poison_released_slot_for_test();
+
+        let leader_host = Arc::clone(&host);
+        let leader = tokio::spawn(async move { leader_host.shutdown().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if host
+                    .lifecycle
+                    .state
+                    .lock()
+                    .expect("read shutdown state")
+                    .shutdown_started
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("leader enters shutdown");
+        let follower_host = Arc::clone(&host);
+        let follower = tokio::spawn(async move { follower_host.shutdown().await });
+
+        backend.complete(&request_id);
+        let consumer_error =
+            tokio::time::timeout(std::time::Duration::from_secs(1), ticket.final_response())
+                .await
+                .expect("consumer finalization must not hang")
+                .expect_err("poisoned finalization must fail the consumer");
+        assert_eq!(consumer_error.code, "speech_lifecycle_finalization_failed");
+
+        let (leader_result, follower_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(leader, follower)
+            })
+            .await
+            .expect("leader and follower must not hang on poisoned finalization");
+        assert_eq!(
+            leader_result.expect("leader joins"),
+            Err(SpeechHostError::StateUnavailable)
+        );
+        assert_eq!(
+            follower_result.expect("follower joins"),
+            Err(SpeechHostError::StateUnavailable)
+        );
+        assert_eq!(backend.shutdown_calls.load(Ordering::Acquire), 1);
     }
 
     #[cfg(feature = "unstable-w1-contract-tests")]
@@ -1303,11 +1639,9 @@ mod tests {
             .expect("task supervisor remains available");
         assert_eq!(
             host.lifecycle
-                .state
-                .lock()
-                .expect("lock host state")
-                .active
-                .len(),
+                .operations
+                .active_count()
+                .expect("read active operations"),
             0
         );
         let task_state = host
@@ -1322,8 +1656,10 @@ mod tests {
     #[tokio::test]
     async fn monitor_panic_is_preserved_in_shutdown_evidence() {
         let host = SpeechHost::default();
-        host.spawn_monitor(async { panic!("fixture monitor panic") })
-            .expect("spawn fixture monitor");
+        host.spawn_monitor("fixture-monitor-panic".to_owned(), async {
+            panic!("fixture monitor panic")
+        })
+        .expect("spawn fixture monitor");
 
         let error = host
             .shutdown()
@@ -1343,10 +1679,9 @@ mod tests {
         host.register_backend(fixture_backend("fixture.tts"))
             .expect("register fixture backend");
         host.lifecycle
-            .state
-            .lock()
-            .expect("lock host state")
-            .next_nonce = u64::MAX;
+            .operations
+            .set_next_sequence_for_test(u64::MAX)
+            .expect("set exhausted sequence");
 
         assert!(matches!(
             host.reserve_synthesis(&exact_request("nonce-exhausted", "fixture.tts")),
@@ -1354,11 +1689,102 @@ mod tests {
         ));
         assert!(
             host.lifecycle
+                .operations
+                .active_count()
+                .expect("read active operations")
+                == 0
+        );
+    }
+
+    #[test]
+    fn setup_transition_failure_rolls_back_registry_and_route() {
+        let host = SpeechHost::default();
+        host.register_backend(fixture_backend("fixture.tts"))
+            .expect("register fixture backend");
+        let request_id = SpeechRequestId("setup-rollback".to_owned());
+        let reserved = host
+            .reserve_synthesis(&exact_request(&request_id.0, "fixture.tts"))
+            .expect("reserve setup fixture");
+        reserved.operation.queue().expect("queue once");
+        let setup_error = reserved
+            .operation
+            .queue()
+            .expect_err("duplicate queue fails");
+
+        assert!(matches!(
+            host.rollback_setup(&request_id, &reserved.operation, setup_error),
+            SpeechHostError::StateUnavailable
+        ));
+        assert_eq!(
+            host.lifecycle.operations.active_count(),
+            Ok(0),
+            "rollback releases the production registry"
+        );
+        assert!(
+            host.lifecycle
                 .state
                 .lock()
-                .expect("lock host state")
-                .active
-                .is_empty()
+                .expect("host state")
+                .routes
+                .is_empty(),
+            "rollback removes the matching production route"
         );
+        assert!(host.lifecycle.faulted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn mismatched_route_release_is_observable_and_preserves_route() {
+        let host = SpeechHost::default();
+        host.register_backend(fixture_backend("fixture.tts"))
+            .expect("register fixture backend");
+        let request_id = SpeechRequestId("route-mismatch".to_owned());
+        let reserved = host
+            .reserve_synthesis(&exact_request(&request_id.0, "fixture.tts"))
+            .expect("reserve route fixture");
+        let mut wrong = reserved.operation.identity();
+        wrong.sequence = wrong
+            .sequence
+            .checked_add(1)
+            .expect("fixture sequence room");
+
+        assert_eq!(
+            host.lifecycle.release_route(&request_id, &wrong),
+            Err(SpeechHostError::StateUnavailable)
+        );
+        assert!(
+            host.lifecycle
+                .state
+                .lock()
+                .expect("host state")
+                .routes
+                .contains_key(&request_id)
+        );
+        assert!(host.lifecycle.faulted.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_rejects_route_registry_identity_mismatch() {
+        let host = SpeechHost::default();
+        let backend = deferred_backend("cancel-identity.tts");
+        host.register_backend(backend.clone())
+            .expect("register deferred backend");
+        let request_id = SpeechRequestId("cancel-identity".to_owned());
+        let reserved = host
+            .reserve_synthesis(&exact_request(&request_id.0, "cancel-identity.tts"))
+            .expect("reserve route fixture");
+        {
+            let mut state = host.lifecycle.state.lock().expect("host state");
+            let route = state.routes.get_mut(&request_id).expect("active route");
+            route.identity.sequence = route
+                .identity
+                .sequence
+                .checked_add(1)
+                .expect("fixture sequence room");
+        }
+
+        assert_eq!(host.cancel(&request_id), 0);
+        assert_eq!(backend.cancel_calls.load(Ordering::Acquire), 0);
+        assert!(host.lifecycle.faulted.load(Ordering::Acquire));
+        drop(reserved);
     }
 }
