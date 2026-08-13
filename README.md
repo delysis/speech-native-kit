@@ -1,5 +1,10 @@
 # speech-native-kit
 
+> **Frozen after native-platform import.** The accepted source history now lives
+> under `crates/services/speech` in `delysis/native-platform`. This repository
+> is read-only and remains unarchived for two stable platform releases before
+> retirement.
+
 `speech-native-kit` is a Tauri-independent, local-first Rust host for speech
 recognition and synthesis. It owns audio-domain contracts, capability routing,
 resident local backends, cancellation, and lifecycle. It does **not** own an
